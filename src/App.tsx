@@ -45,6 +45,8 @@ export default function App() {
   const [activeSlot, setActiveSlot] = useState(0); // 0 - 8
   const [health, setHealth] = useState(20); // 0 - 20 (10 hearts)
   const [hunger, setHunger] = useState(20); // 0 - 20 (10 drumsticks)
+  const [oxygen, setOxygen] = useState(10); // 0 - 10 (10 bubbles underwater)
+  const [isUnderwater, setIsUnderwater] = useState(false);
   const [timeString, setTimeString] = useState('12:00');
   const [lumenPercent, setLumenPercent] = useState(100);
   const [coords, setCoords] = useState({ x: 0, y: 10, z: 0, biome: 'plains' });
@@ -52,6 +54,11 @@ export default function App() {
 
   // Active Screen Menus: null | 'inventory' | 'workbench' | 'furnace' | 'chest' | 'settings' | 'help'
   const [openModal, setOpenModal] = useState<string | null>(null);
+
+  // Water physics timers & tracking
+  const wasInWaterRef = useRef(false);
+  const swimSoundTimerRef = useRef(0);
+  const drownTimerRef = useRef(0);
 
   // Furnace State
   const [furnaceInput, setFurnaceInput] = useState<InventorySlot>({ itemId: null, count: 0 });
@@ -79,11 +86,12 @@ export default function App() {
   // Inventory: 9 hotbar slots + 27 backpack slots = 36 slots
   const [inventory, setInventory] = useState<InventorySlot[]>(() => {
     const slots: InventorySlot[] = Array.from({ length: 36 }, () => ({ itemId: null, count: 0 }));
-    // Starter items: Wood, Planks, Torches, Apples
-    slots[0] = { itemId: 'wood', count: 8 };
-    slots[1] = { itemId: 'planks', count: 16 };
-    slots[2] = { itemId: 'torch', count: 8 };
-    slots[3] = { itemId: 'apple', count: 4 };
+    // Starter items: Wood, Planks, Water Bucket, Torches, Apples
+    slots[0] = { itemId: 'wood', count: 16 };
+    slots[1] = { itemId: 'planks', count: 32 };
+    slots[2] = { itemId: 'water_bucket', count: 1 };
+    slots[3] = { itemId: 'torch', count: 16 };
+    slots[4] = { itemId: 'apple', count: 8 };
     return slots;
   });
 
@@ -183,14 +191,14 @@ export default function App() {
     // 1. Scene, Camera, Renderer
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x87ceeb);
-    scene.fog = new THREE.Fog(0x87ceeb, 12, 55);
+    scene.fog = new THREE.Fog(0x87ceeb, 18, 38);
 
     const camera = new THREE.PerspectiveCamera(fov, window.innerWidth / window.innerHeight, 0.1, 1000);
     camera.position.set(8, 12, 8);
 
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
     renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -295,6 +303,11 @@ export default function App() {
       threeRefs.current.camera.fov = fov;
       threeRefs.current.camera.updateProjectionMatrix();
       threeRefs.current.world.renderDistance = renderDist;
+      if (threeRefs.current.scene.fog instanceof THREE.Fog) {
+        threeRefs.current.scene.fog.near = renderDist * 9;
+        threeRefs.current.scene.fog.far = renderDist * 16 + 6;
+      }
+      threeRefs.current.world.updateInstancedMeshes();
     }
   }, [fov, renderDist]);
 
@@ -407,15 +420,57 @@ export default function App() {
     setTimeString(`${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`);
     setLumenPercent(Math.round(Math.max(0.08, sunY) * 100));
 
-    // 2. Player Movement Physics (True World Coordinates - No Camera Pitch/Yaw Inversion)
-    const speed = moveState.sprint ? 9.5 : 6.0;
-    const gravity = player.flying ? 0 : 25.0;
+    // 2. Physical Water Fluid & Swimming Detection
+    const px = Math.floor(camera.position.x);
+    const py = Math.floor(camera.position.y);
+    const pz = Math.floor(camera.position.z);
+    const feetBlock = world.getBlock(px, Math.floor(camera.position.y - 1.2), pz);
+    const eyeBlock = world.getBlock(px, py, pz);
+    const inWater = feetBlock === BLOCKS.WATER || eyeBlock === BLOCKS.WATER;
+    const headUnderwater = eyeBlock === BLOCKS.WATER;
 
-    player.velocity.x -= player.velocity.x * 10.0 * delta;
-    player.velocity.z -= player.velocity.z * 10.0 * delta;
-    player.velocity.y -= gravity * delta;
-    if (player.flying) {
-      player.velocity.y -= player.velocity.y * 8.0 * delta;
+    // Splash sound & fall kinetic energy absorption
+    if (inWater && !wasInWaterRef.current) {
+      if (player.velocity.y < -3.5) {
+        sound.playSplash();
+      }
+    }
+    wasInWaterRef.current = inWater;
+
+    // 3. Player Movement Physics (True World Coordinates - No Camera Pitch/Yaw Inversion)
+    const speed = inWater ? (moveState.sprint ? 5.5 : 3.8) : (moveState.sprint ? 9.5 : 6.0);
+
+    if (inWater) {
+      // Fluid viscosity / drag (Navier-Stokes linear/quadratic drag)
+      player.velocity.x *= Math.max(0, 1 - 3.8 * delta);
+      player.velocity.z *= Math.max(0, 1 - 3.8 * delta);
+      // Fluid buoyancy (Archimedes principle): upward buoyancy cancels most gravity
+      player.velocity.y -= 4.5 * delta;
+      player.velocity.y *= Math.max(0, 1 - 2.8 * delta);
+      // Terminal sink velocity in water
+      if (player.velocity.y < -3.2) player.velocity.y = -3.2;
+
+      // Active swimming propulsion
+      if (moveState.jump) {
+        player.velocity.y = Math.min(player.velocity.y + 14.0 * delta, 3.8);
+        swimSoundTimerRef.current += delta;
+        if (swimSoundTimerRef.current > 0.45) {
+          sound.playSwim();
+          swimSoundTimerRef.current = 0;
+        }
+      }
+      if (moveState.sprint) {
+        // Shift key dives downward
+        player.velocity.y = Math.max(player.velocity.y - 12.0 * delta, -3.8);
+      }
+    } else {
+      const gravity = player.flying ? 0 : 25.0;
+      player.velocity.x -= player.velocity.x * 10.0 * delta;
+      player.velocity.z -= player.velocity.z * 10.0 * delta;
+      player.velocity.y -= gravity * delta;
+      if (player.flying) {
+        player.velocity.y -= player.velocity.y * 8.0 * delta;
+      }
     }
 
     // Compute stable horizontal forward and right vectors from camera
@@ -442,11 +497,12 @@ export default function App() {
 
     if (inputVec.lengthSq() > 0) {
       inputVec.normalize();
-      player.velocity.x += inputVec.x * speed * 10.0 * delta;
-      player.velocity.z += inputVec.z * speed * 10.0 * delta;
+      const accel = inWater ? 6.0 : 10.0;
+      player.velocity.x += inputVec.x * speed * accel * delta;
+      player.velocity.z += inputVec.z * speed * accel * delta;
 
       // Play step sound
-      if (player.onGround && Math.random() < 0.12) {
+      if (!inWater && player.onGround && Math.random() < 0.12) {
         sound.playStep('grass');
         // Drain tiny hunger on move
         setHunger((h) => Math.max(0, h - delta * 0.08));
@@ -510,18 +566,53 @@ export default function App() {
       handlePlayerDamage(5, '奈落');
     }
 
-    // 3. Update Chunks & World Systems
+    // 4. Update Chunks & World Systems
     world.updateChunks(camera.position);
     world.updateDebris(delta);
+    world.updateWaterPhysics(delta);
 
-    // 4. Update Mobs & Spawns
+    // 5. Atmospheric Underwater Fog & Oxygen Simulation
+    setIsUnderwater(headUnderwater);
+    if (headUnderwater) {
+      if (refs.scene.fog instanceof THREE.Fog) {
+        refs.scene.fog.color.setHex(0x165b7d);
+        refs.scene.fog.near = 1.0;
+        refs.scene.fog.far = 20.0;
+      }
+      // Deplete breath
+      setOxygen((o) => {
+        const nextO = Math.max(0, o - delta * 0.5); // 20s breath
+        if (nextO <= 0) {
+          drownTimerRef.current += delta;
+          if (drownTimerRef.current > 1.2) {
+            handlePlayerDamage(1, '溺死');
+            sound.playHurt();
+            drownTimerRef.current = 0;
+          }
+        }
+        return nextO;
+      });
+      if (Math.random() < 0.04) {
+        sound.playBubble();
+      }
+    } else {
+      if (refs.scene.fog instanceof THREE.Fog) {
+        refs.scene.fog.color.setHex(isNight ? 0x050b14 : 0x87ceeb);
+        refs.scene.fog.near = 18.0;
+        refs.scene.fog.far = 38.0;
+      }
+      setOxygen(10);
+      drownTimerRef.current = 0;
+    }
+
+    // 6. Update Mobs & Spawns
     mobManager.update(delta, camera.position, handlePlayerDamage, handlePickupItem, isNight);
     mobManager.handleSpawning(camera.position, isNight, peaceful);
 
-    // 5. Raycasting for Target Block / Face
+    // 7. Raycasting for Target Block / Face
     updateTargetBlock(refs);
 
-    // 6. Coordinates & Biome HUD update
+    // 8. Coordinates & Biome HUD update
     const { biome } = world.getTerrainHeight(camera.position.x, camera.position.z);
     setCoords({
       x: Math.floor(camera.position.x),
@@ -600,6 +691,7 @@ export default function App() {
           }
           break;
         case 'Space':
+          moveState.jump = true;
           if (player.flying) {
             player.velocity.y = 8;
           } else if (player.onGround) {
@@ -653,6 +745,7 @@ export default function App() {
           }
           break;
         case 'Space':
+          moveState.jump = false;
           if (player.flying && player.velocity.y > 0) {
             player.velocity.y = 0;
           }
@@ -1140,6 +1233,32 @@ export default function App() {
             <div className="text-[11px] font-bold uppercase tracking-wider text-amber-100">実績解除！</div>
             <div className="text-sm font-black text-white">{toastMessage.title}</div>
             <div className="text-xs text-yellow-100">{toastMessage.desc}</div>
+          </div>
+        </div>
+      )}
+
+      {/* Underwater Atmospheric Visual Effect */}
+      {isUnderwater && (
+        <div className="pointer-events-none absolute inset-0 z-15 bg-gradient-to-b from-cyan-900/35 via-teal-800/25 to-blue-950/45 mix-blend-color-burn" />
+      )}
+
+      {/* Oxygen Breath Bubbles Bar (Shown when swimming or oxygen < 10) */}
+      {(isUnderwater || oxygen < 10) && (
+        <div className="absolute bottom-28 left-1/2 -translate-x-1/2 z-20 pointer-events-none w-[420px] max-w-[92vw] flex justify-end items-center px-1">
+          <div className="flex items-center gap-1 bg-black/60 px-2 py-1 rounded-lg backdrop-blur-md border border-cyan-400/30 shadow-lg">
+            <span className="text-[10px] font-mono text-cyan-300 font-bold mr-1 tracking-wider">OXYGEN</span>
+            {Array.from({ length: 10 }).map((_, i) => {
+              const hasBubble = oxygen > i;
+              return (
+                <div key={i} className="relative w-3.5 h-3.5 flex items-center justify-center">
+                  {hasBubble ? (
+                    <span className="text-xs select-none animate-pulse">🫧</span>
+                  ) : (
+                    <span className="text-xs select-none opacity-20">⚪</span>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
       )}

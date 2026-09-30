@@ -335,6 +335,8 @@ export const ITEMS: Record<string, ItemDef> = {
   torch: { id: 'torch', name: '松明', isBlock: true, blockType: BLOCKS.TORCH, maxStack: 64, textureId: 'torch', description: '周囲を明るく照らす' },
   redstone: { id: 'redstone', name: '回路', isBlock: true, blockType: BLOCKS.REDSTONE, maxStack: 64, textureId: 'redstone' },
   flower: { id: 'flower', name: '花', isBlock: true, blockType: BLOCKS.FLOWER, maxStack: 64, textureId: 'flower' },
+  water: { id: 'water', name: '水ブロック', isBlock: true, blockType: BLOCKS.WATER, maxStack: 64, textureId: 'water' },
+  water_bucket: { id: 'water_bucket', name: '水入りバケツ', isBlock: true, blockType: BLOCKS.WATER, maxStack: 16, textureId: 'water', description: '右クリックで水源を設置(水流シミュレーション)' },
 
   // Raw Materials
   stick: { id: 'stick', name: '棒', isBlock: false, maxStack: 64, textureId: 'stick' },

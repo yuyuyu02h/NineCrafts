@@ -269,6 +269,77 @@ class SoundEngine {
     } catch {}
   }
 
+  // Water splash sound (hitting water surface with impact)
+  public playSplash() {
+    if (!this.soundEnabled || !this.ctx) return;
+    try {
+      const now = this.ctx.currentTime;
+      // White noise splash with lowpass sweep
+      this.playNoise(0.28, 800, 0.35, 'bandpass');
+      // Sub-surface bloop
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      gain.connect(this.ctx.destination);
+      osc.connect(gain);
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(320, now);
+      osc.frequency.exponentialRampToValueAtTime(90, now + 0.25);
+
+      gain.gain.setValueAtTime(0.3 * this.volume, now);
+      gain.gain.linearRampToValueAtTime(0, now + 0.25);
+
+      osc.start(now);
+      osc.stop(now + 0.25);
+    } catch {}
+  }
+
+  // Swimming stroke / water movement paddle
+  public playSwim() {
+    if (!this.soundEnabled || !this.ctx) return;
+    try {
+      const now = this.ctx.currentTime;
+      this.playNoise(0.12, 600, 0.2, 'lowpass');
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      gain.connect(this.ctx.destination);
+      osc.connect(gain);
+
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(140 + Math.random() * 30, now);
+      osc.frequency.exponentialRampToValueAtTime(70, now + 0.16);
+
+      gain.gain.setValueAtTime(0.14 * this.volume, now);
+      gain.gain.linearRampToValueAtTime(0, now + 0.16);
+
+      osc.start(now);
+      osc.stop(now + 0.16);
+    } catch {}
+  }
+
+  // Underwater bubble pop
+  public playBubble() {
+    if (!this.soundEnabled || !this.ctx) return;
+    try {
+      const now = this.ctx.currentTime;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      gain.connect(this.ctx.destination);
+      osc.connect(gain);
+
+      osc.type = 'sine';
+      const f0 = 400 + Math.random() * 200;
+      osc.frequency.setValueAtTime(f0, now);
+      osc.frequency.exponentialRampToValueAtTime(f0 * 1.8, now + 0.08);
+
+      gain.gain.setValueAtTime(0.1 * this.volume, now);
+      gain.gain.linearRampToValueAtTime(0, now + 0.08);
+
+      osc.start(now);
+      osc.stop(now + 0.08);
+    } catch {}
+  }
+
   // Crafting / Success chime
   public playCraft() {
     if (!this.soundEnabled || !this.ctx) return;

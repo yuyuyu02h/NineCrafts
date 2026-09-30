@@ -64,6 +64,19 @@ export const CRAFTING_RECIPES: CraftingRecipe[] = [
   },
 
   // 3x3 Workbench Recipes
+  // Water Bucket
+  {
+    id: 'water_bucket',
+    name: '水入りバケツ',
+    gridSize: 3,
+    pattern: [
+      ['iron_ingot', null, 'iron_ingot'],
+      [null, 'iron_ingot', null],
+      [null, null, null],
+    ],
+    result: { itemId: 'water_bucket', count: 1 },
+    category: 'misc',
+  },
   // Pickaxes
   {
     id: 'wood_pickaxe',

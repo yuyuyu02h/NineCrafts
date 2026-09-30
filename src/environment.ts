@@ -43,17 +43,17 @@ export class ShaderEnvironment {
     this.dirLight = new THREE.DirectionalLight(0xfff0dd, 1.2);
     this.dirLight.castShadow = true;
 
-    // High fidelity shadow camera parameters
-    this.dirLight.shadow.mapSize.width = 2048;
-    this.dirLight.shadow.mapSize.height = 2048;
+    // Optimized shadow camera parameters (crisp shadows, 4x faster rendering)
+    this.dirLight.shadow.mapSize.width = 1024;
+    this.dirLight.shadow.mapSize.height = 1024;
     this.dirLight.shadow.camera.near = 0.5;
-    this.dirLight.shadow.camera.far = 160;
-    this.dirLight.shadow.camera.left = -32;
-    this.dirLight.shadow.camera.right = 32;
-    this.dirLight.shadow.camera.top = 32;
-    this.dirLight.shadow.camera.bottom = -32;
+    this.dirLight.shadow.camera.far = 140;
+    this.dirLight.shadow.camera.left = -28;
+    this.dirLight.shadow.camera.right = 28;
+    this.dirLight.shadow.camera.top = 28;
+    this.dirLight.shadow.camera.bottom = -28;
     this.dirLight.shadow.bias = -0.0003;
-    this.dirLight.shadow.normalBias = 0.04;
+    this.dirLight.shadow.normalBias = 0.03;
     this.scene.add(this.dirLight);
     this.scene.add(this.dirLight.target);
 
@@ -326,31 +326,17 @@ export class ShaderEnvironment {
     // Keep Starfield centered on player
     this.starPoints.position.copy(playerPos);
 
-    // 3. Update Volumetric Clouds (Drift slowly with wind)
+    // 3. Update Volumetric Clouds (Translate cloud layer with wind - zero matrix re-upload)
     this.cloudOffset += delta * 1.5;
-    const cloudY = 56;
-    for (let i = 0; i < this.cloudBasePositions.length; i++) {
-      const base = this.cloudBasePositions[i];
-      // Wrap clouds around player
-      const wx = playerPos.x + ((base.x + this.cloudOffset) % 200) - 100;
-      const wz = playerPos.z + (base.z % 200) - 100;
+    this.cloudMesh.position.set(
+      playerPos.x + (this.cloudOffset % 80) - 40,
+      0,
+      playerPos.z
+    );
 
-      this.cloudDummy.position.set(wx, cloudY, wz);
-      this.cloudDummy.scale.set(base.scaleX, 3.5, base.scaleZ);
-      this.cloudDummy.updateMatrix();
-      this.cloudMesh.setMatrixAt(i, this.cloudDummy.matrix);
-    }
-    this.cloudMesh.instanceMatrix.needsUpdate = true;
-
-    // 4. Update Atmospheric Particles (Sun dust / Fireflies)
+    // 4. Update Atmospheric Particles (Gentle rotation with zero buffer re-upload)
     this.particleSystem.position.copy(playerPos);
-    const pArr = (this.particleSystem.geometry.attributes.position as THREE.BufferAttribute).array as Float32Array;
-    for (let i = 0; i < this.particleCount; i++) {
-      const idx = i * 3;
-      pArr[idx + 1] += Math.sin(this.cloudOffset * 2 + i) * 0.015; // gentle float
-      pArr[idx] += Math.cos(this.cloudOffset + i) * 0.01;
-    }
-    this.particleSystem.geometry.attributes.position.needsUpdate = true;
+    this.particleSystem.rotation.y += delta * 0.05;
     (this.particleSystem.material as THREE.PointsMaterial).color.setHex(isNight ? 0x88ffaa : 0xffe077);
   }
 }
