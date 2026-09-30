@@ -25,6 +25,8 @@ export function canvasToTexture(canvas: HTMLCanvasElement, transparent = false):
   const tex = new THREE.CanvasTexture(canvas);
   tex.magFilter = THREE.NearestFilter;
   tex.minFilter = THREE.NearestFilter;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
   if (transparent) {
     tex.generateMipmaps = false;
   }

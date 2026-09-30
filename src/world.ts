@@ -69,99 +69,124 @@ export class VoxelWorld {
     return `${cx},${cz}`;
   }
 
+  public waterMaterial: THREE.MeshStandardMaterial | null = null;
+
   private initInstancedMeshes() {
     const geo = new THREE.BoxGeometry(1, 1, 1);
     const { textures } = this.atlas;
 
-    // Helper to make material
-    const makeMat = (texKey: string, transparent = false, opacity = 1.0, emissive = false) => {
+    // Helper to make PBR standard material (Shader Mod quality)
+    const makeMat = (
+      texKey: string,
+      options: {
+        transparent?: boolean;
+        opacity?: number;
+        emissive?: boolean;
+        roughness?: number;
+        metalness?: number;
+      } = {}
+    ) => {
       const tex = textures[texKey];
-      return new THREE.MeshLambertMaterial({
+      const {
+        transparent = false,
+        opacity = 1.0,
+        emissive = false,
+        roughness = 0.85,
+        metalness = 0.05,
+      } = options;
+
+      return new THREE.MeshStandardMaterial({
         map: tex,
         transparent,
         opacity,
-        alphaTest: transparent && opacity === 1.0 ? 0.4 : 0,
+        alphaTest: transparent && opacity === 1.0 ? 0.35 : 0,
+        roughness,
+        metalness,
         emissive: emissive ? new THREE.Color(0xffaa44) : new THREE.Color(0x000000),
         emissiveMap: emissive ? tex : null,
+        emissiveIntensity: emissive ? 2.0 : 0,
       });
     };
+
+    const waterMat = makeMat('water', { transparent: true, opacity: 0.65, roughness: 0.08, metalness: 0.1 });
+    this.waterMaterial = waterMat;
 
     // Build materials for each block
     const blockMaterials: Record<number, THREE.Material | THREE.Material[]> = {
       [BLOCKS.GRASS]: [
-        makeMat('grass_side'),
-        makeMat('grass_side'),
-        makeMat('grass_top'),
-        makeMat('dirt'),
-        makeMat('grass_side'),
-        makeMat('grass_side'),
+        makeMat('grass_side', { roughness: 0.88 }),
+        makeMat('grass_side', { roughness: 0.88 }),
+        makeMat('grass_top', { roughness: 0.95 }),
+        makeMat('dirt', { roughness: 0.95 }),
+        makeMat('grass_side', { roughness: 0.88 }),
+        makeMat('grass_side', { roughness: 0.88 }),
       ],
-      [BLOCKS.DIRT]: makeMat('dirt'),
-      [BLOCKS.STONE]: makeMat('stone'),
-      [BLOCKS.COBBLESTONE]: makeMat('cobblestone'),
+      [BLOCKS.DIRT]: makeMat('dirt', { roughness: 0.95 }),
+      [BLOCKS.STONE]: makeMat('stone', { roughness: 0.85, metalness: 0.08 }),
+      [BLOCKS.COBBLESTONE]: makeMat('cobblestone', { roughness: 0.9, metalness: 0.05 }),
       [BLOCKS.WOOD]: [
-        makeMat('wood_side'),
-        makeMat('wood_side'),
-        makeMat('wood_top'),
-        makeMat('wood_top'),
-        makeMat('wood_side'),
-        makeMat('wood_side'),
+        makeMat('wood_side', { roughness: 0.8 }),
+        makeMat('wood_side', { roughness: 0.8 }),
+        makeMat('wood_top', { roughness: 0.85 }),
+        makeMat('wood_top', { roughness: 0.85 }),
+        makeMat('wood_side', { roughness: 0.8 }),
+        makeMat('wood_side', { roughness: 0.8 }),
       ],
-      [BLOCKS.LEAVES]: makeMat('leaves', true),
-      [BLOCKS.PLANKS]: makeMat('planks'),
-      [BLOCKS.SAND]: makeMat('sand'),
-      [BLOCKS.GLASS]: makeMat('glass', true, 0.4),
-      [BLOCKS.BRICK]: makeMat('brick'),
+      [BLOCKS.LEAVES]: makeMat('leaves', { transparent: true, roughness: 0.7 }),
+      [BLOCKS.PLANKS]: makeMat('planks', { roughness: 0.75 }),
+      [BLOCKS.SAND]: makeMat('sand', { roughness: 0.92 }),
+      [BLOCKS.GLASS]: makeMat('glass', { transparent: true, opacity: 0.35, roughness: 0.05, metalness: 0.15 }),
+      [BLOCKS.BRICK]: makeMat('brick', { roughness: 0.8 }),
       [BLOCKS.BOOKSHELF]: [
-        makeMat('bookshelf'),
-        makeMat('bookshelf'),
-        makeMat('planks'),
-        makeMat('planks'),
-        makeMat('bookshelf'),
-        makeMat('bookshelf'),
+        makeMat('bookshelf', { roughness: 0.75 }),
+        makeMat('bookshelf', { roughness: 0.75 }),
+        makeMat('planks', { roughness: 0.75 }),
+        makeMat('planks', { roughness: 0.75 }),
+        makeMat('bookshelf', { roughness: 0.75 }),
+        makeMat('bookshelf', { roughness: 0.75 }),
       ],
-      [BLOCKS.COAL_ORE]: makeMat('coal_ore'),
-      [BLOCKS.IRON_ORE]: makeMat('iron_ore'),
-      [BLOCKS.GOLD_ORE]: makeMat('gold_ore'),
-      [BLOCKS.DIAMOND_ORE]: makeMat('diamond_ore'),
+      [BLOCKS.COAL_ORE]: makeMat('coal_ore', { roughness: 0.8, metalness: 0.1 }),
+      [BLOCKS.IRON_ORE]: makeMat('iron_ore', { roughness: 0.5, metalness: 0.45 }),
+      [BLOCKS.GOLD_ORE]: makeMat('gold_ore', { roughness: 0.25, metalness: 0.85 }),
+      [BLOCKS.DIAMOND_ORE]: makeMat('diamond_ore', { roughness: 0.15, metalness: 0.65 }),
       [BLOCKS.CRAFTING_TABLE]: [
-        makeMat('crafting_table_side'),
-        makeMat('crafting_table_side'),
-        makeMat('crafting_table_top'),
-        makeMat('planks'),
-        makeMat('crafting_table_side'),
-        makeMat('crafting_table_side'),
+        makeMat('crafting_table_side', { roughness: 0.75 }),
+        makeMat('crafting_table_side', { roughness: 0.75 }),
+        makeMat('crafting_table_top', { roughness: 0.75 }),
+        makeMat('planks', { roughness: 0.75 }),
+        makeMat('crafting_table_side', { roughness: 0.75 }),
+        makeMat('crafting_table_side', { roughness: 0.75 }),
       ],
       [BLOCKS.FURNACE]: [
-        makeMat('furnace_side'),
-        makeMat('furnace_side'),
-        makeMat('furnace_top'),
-        makeMat('furnace_top'),
-        makeMat('furnace_front'),
-        makeMat('furnace_side'),
+        makeMat('furnace_side', { roughness: 0.85 }),
+        makeMat('furnace_side', { roughness: 0.85 }),
+        makeMat('furnace_top', { roughness: 0.85 }),
+        makeMat('furnace_top', { roughness: 0.85 }),
+        makeMat('furnace_front', { roughness: 0.85 }),
+        makeMat('furnace_side', { roughness: 0.85 }),
       ],
       [BLOCKS.CHEST]: [
-        makeMat('chest_side'),
-        makeMat('chest_side'),
-        makeMat('chest_top'),
-        makeMat('chest_top'),
-        makeMat('chest_front'),
-        makeMat('chest_side'),
+        makeMat('chest_side', { roughness: 0.75 }),
+        makeMat('chest_side', { roughness: 0.75 }),
+        makeMat('chest_top', { roughness: 0.75 }),
+        makeMat('chest_top', { roughness: 0.75 }),
+        makeMat('chest_front', { roughness: 0.75 }),
+        makeMat('chest_side', { roughness: 0.75 }),
       ],
       [BLOCKS.TNT]: [
-        makeMat('tnt_side'),
-        makeMat('tnt_side'),
-        makeMat('tnt_top'),
-        makeMat('dirt'),
-        makeMat('tnt_side'),
-        makeMat('tnt_side'),
+        makeMat('tnt_side', { roughness: 0.8 }),
+        makeMat('tnt_side', { roughness: 0.8 }),
+        makeMat('tnt_top', { roughness: 0.8 }),
+        makeMat('dirt', { roughness: 0.95 }),
+        makeMat('tnt_side', { roughness: 0.8 }),
+        makeMat('tnt_side', { roughness: 0.8 }),
       ],
-      [BLOCKS.BED]: makeMat('bed'),
-      [BLOCKS.REDSTONE]: makeMat('redstone', false, 1.0, true),
-      [BLOCKS.BEDROCK]: makeMat('stone'),
-      [BLOCKS.WATER]: makeMat('water', true, 0.65),
-      [BLOCKS.TORCH]: makeMat('torch', true, 1.0, true),
-      [BLOCKS.FLOWER]: makeMat('flower', true),
+      [BLOCKS.BED]: makeMat('bed', { roughness: 0.8 }),
+      [BLOCKS.REDSTONE]: makeMat('redstone', { emissive: true, roughness: 0.3, metalness: 0.2 }),
+      [BLOCKS.BEDROCK]: makeMat('stone', { roughness: 0.95 }),
+      [BLOCKS.WATER]: waterMat,
+      [BLOCKS.TORCH]: makeMat('torch', { transparent: true, emissive: true, roughness: 0.2 }),
+      [BLOCKS.FLOWER]: makeMat('flower', { transparent: true, roughness: 0.8 }),
     };
 
     // Instantiate InstancedMesh for each block type
@@ -170,10 +195,17 @@ export class VoxelWorld {
       const mat = blockMaterials[type];
       const imesh = new THREE.InstancedMesh(geo, mat, MAX_INSTANCES_PER_BLOCK);
       imesh.castShadow = type !== BLOCKS.GLASS && type !== BLOCKS.WATER && type !== BLOCKS.TORCH;
-      imesh.receiveShadow = type !== BLOCKS.GLASS && type !== BLOCKS.WATER;
+      imesh.receiveShadow = type !== BLOCKS.GLASS;
       imesh.count = 0;
       this.scene.add(imesh);
       this.instancedMeshes[type] = imesh;
+    }
+  }
+
+  public animateWater(delta: number) {
+    if (this.waterMaterial && this.waterMaterial.map) {
+      this.waterMaterial.map.offset.x = (this.waterMaterial.map.offset.x + delta * 0.05) % 1;
+      this.waterMaterial.map.offset.y = (this.waterMaterial.map.offset.y + delta * 0.03) % 1;
     }
   }
 
@@ -419,8 +451,8 @@ export class VoxelWorld {
       counts[parseInt(key)] = 0;
     }
 
-    const pCx = centerPos ? Math.floor(centerPos.x / CHUNK_SIZE) : this.lastPlayerChunkX || 0;
-    const pCz = centerPos ? Math.floor(centerPos.z / CHUNK_SIZE) : this.lastPlayerChunkZ || 0;
+    const pCx = centerPos ? Math.floor(centerPos.x / CHUNK_SIZE) : (this.lastPlayerChunkX !== null ? this.lastPlayerChunkX : 0);
+    const pCz = centerPos ? Math.floor(centerPos.z / CHUNK_SIZE) : (this.lastPlayerChunkZ !== null ? this.lastPlayerChunkZ : 0);
 
     for (let cx = pCx - this.renderDistance; cx <= pCx + this.renderDistance; cx++) {
       for (let cz = pCz - this.renderDistance; cz <= pCz + this.renderDistance; cz++) {
@@ -582,5 +614,76 @@ export class VoxelWorld {
       this.addBlock(b.x, b.y, b.z, b.type, false);
     }
     this.updateInstancedMeshes();
+  }
+
+  // Fast Voxel Traversal (DDA) for 100% reliable raycasting
+  public raycast(
+    origin: THREE.Vector3,
+    direction: THREE.Vector3,
+    maxDistance = 6.0
+  ): { blockPos: THREE.Vector3; normal: THREE.Vector3; blockId: BlockId; distance: number } | null {
+    const dir = direction.clone().normalize();
+    let x = Math.floor(origin.x);
+    let y = Math.floor(origin.y);
+    let z = Math.floor(origin.z);
+
+    const stepX = dir.x > 0 ? 1 : dir.x < 0 ? -1 : 0;
+    const stepY = dir.y > 0 ? 1 : dir.y < 0 ? -1 : 0;
+    const stepZ = dir.z > 0 ? 1 : dir.z < 0 ? -1 : 0;
+
+    const tDeltaX = dir.x !== 0 ? Math.abs(1 / dir.x) : Infinity;
+    const tDeltaY = dir.y !== 0 ? Math.abs(1 / dir.y) : Infinity;
+    const tDeltaZ = dir.z !== 0 ? Math.abs(1 / dir.z) : Infinity;
+
+    const distStartX = stepX > 0 ? x + 1 - origin.x : stepX < 0 ? origin.x - x : Infinity;
+    const distStartY = stepY > 0 ? y + 1 - origin.y : stepY < 0 ? origin.y - y : Infinity;
+    const distStartZ = stepZ > 0 ? z + 1 - origin.z : stepZ < 0 ? origin.z - z : Infinity;
+
+    let tMaxX = tDeltaX !== Infinity ? distStartX * tDeltaX : Infinity;
+    let tMaxY = tDeltaY !== Infinity ? distStartY * tDeltaY : Infinity;
+    let tMaxZ = tDeltaZ !== Infinity ? distStartZ * tDeltaZ : Infinity;
+
+    const normal = new THREE.Vector3(0, 1, 0);
+    let currentDist = 0;
+
+    while (currentDist <= maxDistance) {
+      const block = this.getBlock(x, y, z);
+      if (block !== null && block !== BLOCKS.AIR && block !== BLOCKS.WATER) {
+        return {
+          blockPos: new THREE.Vector3(x, y, z),
+          normal: normal.clone(),
+          blockId: block,
+          distance: currentDist,
+        };
+      }
+
+      if (tMaxX < tMaxY) {
+        if (tMaxX < tMaxZ) {
+          currentDist = tMaxX;
+          tMaxX += tDeltaX;
+          x += stepX;
+          normal.set(-stepX, 0, 0);
+        } else {
+          currentDist = tMaxZ;
+          tMaxZ += tDeltaZ;
+          z += stepZ;
+          normal.set(0, 0, -stepZ);
+        }
+      } else {
+        if (tMaxY < tMaxZ) {
+          currentDist = tMaxY;
+          tMaxY += tDeltaY;
+          y += stepY;
+          normal.set(0, -stepY, 0);
+        } else {
+          currentDist = tMaxZ;
+          tMaxZ += tDeltaZ;
+          z += stepZ;
+          normal.set(0, 0, -stepZ);
+        }
+      }
+    }
+
+    return null;
   }
 }

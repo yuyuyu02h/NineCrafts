@@ -247,6 +247,28 @@ class SoundEngine {
     } catch {}
   }
 
+  // UI Item slot click / pop sound
+  public playPop() {
+    if (!this.soundEnabled || !this.ctx) return;
+    try {
+      const now = this.ctx.currentTime;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      gain.connect(this.ctx.destination);
+      osc.connect(gain);
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(440, now);
+      osc.frequency.exponentialRampToValueAtTime(880, now + 0.05);
+
+      gain.gain.setValueAtTime(0.15 * this.volume, now);
+      gain.gain.linearRampToValueAtTime(0, now + 0.05);
+
+      osc.start(now);
+      osc.stop(now + 0.05);
+    } catch {}
+  }
+
   // Crafting / Success chime
   public playCraft() {
     if (!this.soundEnabled || !this.ctx) return;
