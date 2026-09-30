@@ -1,0 +1,6 @@
+{
+  "name": "VoxelVerse: 3D Sandbox & Survival",
+  "description": "An expansive 3D voxel sandbox survival game featuring procedural terrain, deep caves, full crafting system, furnace smelting, tools progression, day-night cycle, diverse mobs, audio synthesizer, and creative mode.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
