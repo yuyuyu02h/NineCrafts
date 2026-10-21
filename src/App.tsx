@@ -9,6 +9,15 @@ import { sound } from './audio';
 import { InventorySlot, GameMode, Achievement } from './types';
 import { CRAFTING_RECIPES, SMELTING_RECIPES, matchRecipe } from './recipes';
 import { ShaderEnvironment } from './environment';
+import { loadGame, saveGame } from './storage';
+import { SAVE_VERSION, type GameSave } from './save';
+import { useItems } from './useItems';
+import { clickInventory, clickCraftCell, craftGrid, quickCraft, insertStack, stack, returnCursor, ensureFurnace, clickFurnaceSlot, collectFurnace, wearTool } from './items';
+import { consumeSlot, stepFurnace } from './furnace';
+import { miningRule, toolSignature } from './mining';
+import { ItemMenu } from './ItemMenu';
+import { TouchControls } from './TouchControls';
+import { bindGameMouse } from './mouseInput';
 import {
   Volume2,
   VolumeX,
@@ -38,9 +47,26 @@ const INITIAL_ACHIEVEMENTS: Achievement[] = [
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [isReady, setIsReady] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [storageError, setStorageError] = useState(false);
+  const [storageStatus, setStorageStatus] = useState('保存データを確認中…');
+  const persistenceRef = useRef({ initialized: false, canWrite: false, busy: false, lastSavedAt: null as number | null });
 
   // Game UI States
-  const [isLocked, setIsLocked] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const playingRef = useRef(false);
+  const setPlaying = useCallback((value: boolean) => { playingRef.current = value; setIsPlaying(value); }, []);
+  const [touchEnabled, setTouchEnabled] = useState(() => window.matchMedia('(pointer: coarse)').matches);
+  const touchEnabledRef = useRef(touchEnabled);
+  touchEnabledRef.current = touchEnabled;
+  const touchMoveRef = useRef({ x: 0, z: 0 });
+  const primaryHeldRef = useRef(false);
+  const [miningView, setMiningView] = useState({ percent: 0, label: '' });
+  const [itemMessage, setItemMessage] = useState('');
+  const [activeFurnaceKey, setActiveFurnaceKey] = useState<string | null>(null);
+  const { items, itemsRef, updateItems, publishItems } = useItems();
+  const { inventory, cursorItem, craft2x2, craft3x3 } = items;
   const [gameMode, setGameMode] = useState<GameMode>('survival');
   const [activeSlot, setActiveSlot] = useState(0); // 0 - 8
   const [health, setHealth] = useState(20); // 0 - 20 (10 hearts)
@@ -60,13 +86,6 @@ export default function App() {
   const swimSoundTimerRef = useRef(0);
   const drownTimerRef = useRef(0);
 
-  // Furnace State
-  const [furnaceInput, setFurnaceInput] = useState<InventorySlot>({ itemId: null, count: 0 });
-  const [furnaceFuel, setFurnaceFuel] = useState<InventorySlot>({ itemId: null, count: 0 });
-  const [furnaceOutput, setFurnaceOutput] = useState<InventorySlot>({ itemId: null, count: 0 });
-  const [furnaceProgress, setFurnaceProgress] = useState(0); // 0 to 100
-  const [furnaceFuelTime, setFurnaceFuelTime] = useState(0);
-
   // Chest State (27 slots)
   const [chestSlots, setChestSlots] = useState<InventorySlot[]>(
     () => Array.from({ length: 27 }, () => ({ itemId: null, count: 0 }))
@@ -83,48 +102,26 @@ export default function App() {
   const [toastMessage, setToastMessage] = useState<{ title: string; desc: string; icon: string } | null>(null);
   const [achievements, setAchievements] = useState<Achievement[]>(INITIAL_ACHIEVEMENTS);
 
-  // Inventory: 9 hotbar slots + 27 backpack slots = 36 slots
-  const [inventory, setInventory] = useState<InventorySlot[]>(() => {
-    const slots: InventorySlot[] = Array.from({ length: 36 }, () => ({ itemId: null, count: 0 }));
-    // Starter items: Wood, Planks, Water Bucket, Torches, Apples
-    slots[0] = { itemId: 'wood', count: 16 };
-    slots[1] = { itemId: 'planks', count: 32 };
-    slots[2] = { itemId: 'water_bucket', count: 1 };
-    slots[3] = { itemId: 'torch', count: 16 };
-    slots[4] = { itemId: 'apple', count: 8 };
-    return slots;
-  });
-
-  // 2x2 Crafting Grid (for player inventory)
-  const [craft2x2, setCraft2x2] = useState<(string | null)[][]>([
-    [null, null],
-    [null, null],
-  ]);
-  const [craft2x2Result, setCraft2x2Result] = useState<{ itemId: string; count: number } | null>(null);
-
-  // 3x3 Crafting Grid (for workbench)
-  const [craft3x3, setCraft3x3] = useState<(string | null)[][]>([
-    [null, null, null],
-    [null, null, null],
-    [null, null, null],
-  ]);
-  const [craft3x3Result, setCraft3x3Result] = useState<{ itemId: string; count: number } | null>(null);
-
-  // Dragging / Selected Cursor Item
-  const [cursorItem, setCursorItem] = useState<InventorySlot | null>(null);
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
 
   // Synchronized refs for event handlers (avoids stale closures during PointerLock)
   const activeSlotRef = useRef(activeSlot);
   activeSlotRef.current = activeSlot;
-  const inventoryRef = useRef(inventory);
-  inventoryRef.current = inventory;
   const gameModeRef = useRef(gameMode);
   gameModeRef.current = gameMode;
   const openModalRef = useRef(openModal);
   openModalRef.current = openModal;
-  const cursorItemRef = useRef(cursorItem);
-  cursorItemRef.current = cursorItem;
+  const setModal = useCallback((value: string | null) => { openModalRef.current = value; setOpenModal(value); }, []);
+
+  // The save callback reads the latest committed UI snapshot, not the initialization closure.
+  const saveUi = {
+    activeSlot, chestSlots,
+    achievements: achievements.filter(a => a.unlocked).map(a => a.id),
+    settings: { gameMode, soundEnabled, musicEnabled, fov, renderDist, peaceful },
+    health, hunger, oxygen,
+  };
+  const saveUiRef = useRef(saveUi);
+  saveUiRef.current = saveUi;
 
   // Three.js References
   const threeRefs = useRef<{
@@ -151,11 +148,69 @@ export default function App() {
       stage: number;
       timer: number;
       maxDuration: number;
+      signature: string;
     };
     lastAttackTime: number;
     lastHurtTime: number;
     isNight: boolean;
   } | null>(null);
+
+  const saveCurrentGame = useCallback(async () => {
+    const persistence = persistenceRef.current;
+    const refs = threeRefs.current;
+    if (!refs || !persistence.initialized || !persistence.canWrite || persistence.busy) return;
+    const ui = saveUiRef.current;
+    // Death is followed by the existing respawn flow. Don't persist an intermediate HP=0 state.
+    if (ui.health <= 0) return;
+    persistence.busy = true;
+    setIsSaving(true);
+    try {
+      const { health, hunger, oxygen, ...rest } = ui;
+      const snapshot: GameSave = structuredClone({
+        ...rest,
+        ...itemsRef.current,
+        version: SAVE_VERSION,
+        savedAt: Math.max(Date.now(), (persistence.lastSavedAt ?? 0) + 1),
+        world: refs.world.exportSaveData(),
+        player: {
+          position: refs.camera.position.toArray() as [number, number, number],
+          rotation: [refs.camera.rotation.x, refs.camera.rotation.y, refs.camera.rotation.z],
+          health, hunger, oxygen, flying: refs.player.flying,
+        },
+        timeOfDay: ((refs.timeOfDay % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2),
+        drops: refs.mobManager.droppedItems.filter(d => d.life > 0).map(d => ({
+          itemId: d.itemId, count: d.count, durability: d.durability,
+          position: d.position.toArray() as [number, number, number],
+          velocity: d.velocity.toArray() as [number, number, number], life: d.life,
+        })),
+      });
+      await saveGame(snapshot, persistence.lastSavedAt);
+      persistence.lastSavedAt = snapshot.savedAt;
+      setStorageError(false);
+      setStorageStatus(`保存しました（${new Date(snapshot.savedAt).toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo' })}）`);
+    } catch (error) {
+      setStorageError(true);
+      setStorageStatus(error instanceof Error ? error.message : '保存できませんでした。進行はこの画面に保持しています。');
+    } finally {
+      persistence.busy = false;
+      setIsSaving(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isReady) return;
+    const interval = window.setInterval(() => { void saveCurrentGame(); }, 30_000);
+    const onHidden = () => { if (document.hidden) void saveCurrentGame(); };
+    document.addEventListener('visibilitychange', onHidden);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', onHidden);
+    };
+  }, [isReady, saveCurrentGame]);
+
+  useEffect(() => {
+    if (openModal) void saveCurrentGame();
+  }, [openModal, saveCurrentGame]);
 
   // Unlock achievement helper
   const unlockAchievement = useCallback((id: string) => {
@@ -171,17 +226,6 @@ export default function App() {
       })
     );
   }, []);
-
-  // Update craft outputs when crafting grids change
-  useEffect(() => {
-    const res2 = matchRecipe(craft2x2, 2);
-    setCraft2x2Result(res2 ? res2.result : null);
-  }, [craft2x2]);
-
-  useEffect(() => {
-    const res3 = matchRecipe(craft3x3, 3);
-    setCraft3x3Result(res3 ? res3.result : null);
-  }, [craft3x3]);
 
   // Main Three.js Initialization
   useEffect(() => {
@@ -208,16 +252,18 @@ export default function App() {
     const environment = new ShaderEnvironment(scene, camera);
 
     // 3. PointerLockControls
-    const controls = new PointerLockControls(camera, document.body);
+    const controls = new PointerLockControls(camera, canvas);
 
     controls.addEventListener('lock', () => {
-      setIsLocked(true);
-      setOpenModal(null);
+      setItemMessage('');
+      setPlaying(true);
+      setModal(null);
       sound.unlock();
     });
 
     controls.addEventListener('unlock', () => {
-      setIsLocked(false);
+      if (!touchEnabledRef.current) setPlaying(false);
+      resetControls();
     });
 
     // 4. Texture Atlas & World
@@ -225,12 +271,6 @@ export default function App() {
     const world = new VoxelWorld(scene, atlas);
     const mobManager = new MobManager(scene, world);
 
-    // Generate initial spawn area chunks
-    world.updateChunks(camera.position);
-
-    // Ensure player is above surface at spawn
-    const { height: spawnY } = world.getTerrainHeight(8, 8);
-    camera.position.set(8, Math.max(spawnY + 2.5, 5), 8);
 
     const clock = new THREE.Clock();
 
@@ -258,12 +298,101 @@ export default function App() {
         stage: 0,
         timer: 0,
         maxDuration: 0.5,
+        signature: '',
       },
       lastAttackTime: 0,
       lastHurtTime: 0,
       isNight: false,
     };
     threeRefs.current = refs;
+    world.onBlockRemoved = (x, y, z, type) => {
+      if (type !== BLOCKS.FURNACE) return;
+      const key = world.getKey(x, y, z);
+      const furnace = itemsRef.current.furnaces[key];
+      if (!furnace) return;
+      for (const value of [furnace.input, furnace.fuel, furnace.output]) {
+        if (value.itemId) mobManager.spawnDroppedItem(value.itemId, value.count, new THREE.Vector3(x + 0.5, y + 0.5, z + 0.5), value.durability);
+      }
+      updateItems(state => { const furnaces = { ...state.furnaces }; delete furnaces[key]; return { ...state, furnaces }; });
+    };
+    let disposed = false;
+    const initializeSave = async () => {
+      let restored: GameSave | null = null;
+      try {
+        restored = await loadGame();
+        if (disposed) return;
+        persistenceRef.current.canWrite = true;
+        persistenceRef.current.lastSavedAt = restored?.savedAt ?? null;
+      } catch (error) {
+        if (disposed) return;
+        // A failed load must never replace an existing save with a fresh world.
+        persistenceRef.current.canWrite = false;
+        setStorageError(true);
+        setStorageStatus(`${error instanceof Error ? error.message : '保存データを読み込めませんでした。'} 保存を停止しています。再読み込みして確認してください。`);
+      }
+      if (disposed) return;
+      if (restored) {
+        world.importSaveData(restored.world);
+        world.renderDistance = restored.settings.renderDist;
+        camera.position.fromArray(restored.player.position);
+        camera.rotation.set(...restored.player.rotation, 'YXZ');
+        refs.timeOfDay = restored.timeOfDay;
+        refs.player.flying = restored.settings.gameMode === 'creative' && restored.player.flying;
+        setHealth(restored.player.health);
+        setHunger(restored.player.hunger);
+        setOxygen(restored.player.oxygen);
+        updateItems(() => ({ inventory: restored.inventory, cursorItem: restored.cursorItem,
+          craft2x2: restored.craft2x2, craft3x3: restored.craft3x3,
+          furnaces: restored.furnaces, legacyFurnace: restored.legacyFurnace }));
+        setActiveSlot(restored.activeSlot);
+        setChestSlots(restored.chestSlots);
+        setAchievements(INITIAL_ACHIEVEMENTS.map(a => ({ ...a, unlocked: restored.achievements.includes(a.id) })));
+        setGameMode(restored.settings.gameMode);
+        setSoundEnabled(restored.settings.soundEnabled);
+        setMusicEnabled(restored.settings.musicEnabled);
+        setFov(restored.settings.fov);
+        setRenderDist(restored.settings.renderDist);
+        setPeaceful(restored.settings.peaceful);
+        for (const drop of restored.drops) {
+          mobManager.spawnDroppedItem(drop.itemId, drop.count, new THREE.Vector3(...drop.position), drop.durability);
+          const entity = mobManager.droppedItems[mobManager.droppedItems.length - 1];
+          entity.position.fromArray(drop.position);
+          entity.velocity.fromArray(drop.velocity);
+          entity.life = drop.life;
+        }
+        setStorageStatus(`続きから再開できます（${new Date(restored.savedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}）`);
+      } else {
+        const { height: spawnY } = world.getTerrainHeight(8, 8);
+        camera.position.set(8, Math.max(spawnY + 2.7, 5), 8);
+        if (persistenceRef.current.canWrite) setStorageStatus('30秒ごとに自動保存します。設定画面から手動でも保存できます。');
+      }
+      world.updateChunks(camera.position);
+      // Earlier saves placed the eye only 2.5 blocks above terrain, embedding the feet.
+      // Lift only an overlapping player, so normal saved positions remain untouched.
+      for (let attempt = 0; attempt < 64; attempt++) {
+        let floor = -Infinity;
+        for (let x = Math.floor(camera.position.x - refs.player.radius); x <= Math.floor(camera.position.x + refs.player.radius); x++) {
+          for (let z = Math.floor(camera.position.z - refs.player.radius); z <= Math.floor(camera.position.z + refs.player.radius); z++) {
+            for (let y = Math.floor(camera.position.y - refs.player.height); y <= Math.floor(camera.position.y + 0.1); y++) {
+              const block = world.getBlock(x, y, z);
+              if (block && BLOCK_DEFS[block]?.isSolid) floor = Math.max(floor, y + 1);
+            }
+          }
+        }
+        if (!Number.isFinite(floor)) break;
+        camera.position.y = floor + refs.player.height + 0.01;
+      }
+      const { biome } = world.getTerrainHeight(camera.position.x, camera.position.z);
+      setCoords({ x: Math.floor(camera.position.x), y: Math.floor(camera.position.y), z: Math.floor(camera.position.z), biome });
+      const hours = Math.floor(((refs.timeOfDay / (Math.PI * 2)) * 24 + 6) % 24);
+      const minutes = Math.floor((refs.timeOfDay / (Math.PI * 2)) * 24 * 60 % 60);
+      setTimeString(`${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`);
+      environment.update(0, refs.timeOfDay, camera.position);
+      persistenceRef.current.initialized = true;
+      clock.getDelta();
+      setIsReady(true);
+    };
+    void initializeSave();
 
     // Window Resize Handler
     const handleResize = () => {
@@ -275,14 +404,37 @@ export default function App() {
 
     // Main Game Animation Loop
     let animId: number;
-    let spawnTimer = 0;
+    let uiTimer = 0;
 
     const animate = () => {
       animId = requestAnimationFrame(animate);
       const delta = Math.min(clock.getDelta(), 0.08);
 
-      if (controls.isLocked) {
+      const ready = persistenceRef.current.initialized && !document.hidden;
+      const equipmentOpen = ['inventory', 'workbench', 'furnace'].includes(openModalRef.current ?? '');
+      if (ready && (playingRef.current || equipmentOpen)) {
+        updateItems(state => {
+          let changed = false;
+          const furnaces = { ...state.furnaces };
+          for (const [key, furnace] of Object.entries(furnaces)) {
+            const next = stepFurnace(furnace, delta);
+            if (next !== furnace) { furnaces[key] = next; changed = true; }
+          }
+          return changed ? { ...state, furnaces } : state;
+        }, false);
+      }
+      if (ready && playingRef.current) {
         updateGame(delta, refs);
+        processPrimary(delta, refs);
+      }
+      uiTimer += delta;
+      if (uiTimer >= 0.1) {
+        uiTimer = 0;
+        publishItems();
+        const progress = refs.breakProgress;
+        const percent = progress.pos ? Math.min(100, progress.timer / progress.maxDuration * 100) : 0;
+        const label = miningHintRef.current;
+        setMiningView(previous => previous.percent === percent && previous.label === label ? previous : { percent, label });
       }
 
       renderer.render(scene, camera);
@@ -290,6 +442,8 @@ export default function App() {
     animate();
 
     return () => {
+      disposed = true;
+      persistenceRef.current.initialized = false;
       cancelAnimationFrame(animId);
       window.removeEventListener('resize', handleResize);
       controls.dispose();
@@ -317,60 +471,76 @@ export default function App() {
     sound.musicEnabled = musicEnabled;
   }, [soundEnabled, musicEnabled]);
 
-  // Pickup item helper
-  const handlePickupItem = useCallback((itemId: string, count: number): boolean => {
-    setInventory((prev) => {
-      const next = [...prev];
-      const def = ITEMS[itemId];
-      if (!def) return prev;
+  useEffect(() => {
+    if (gameMode !== 'creative' && threeRefs.current) {
+      threeRefs.current.player.flying = false;
+    }
+  }, [gameMode]);
 
-      let remaining = count;
-
-      // 1. Try stacking onto existing slots
-      for (let i = 0; i < next.length; i++) {
-        if (next[i].itemId === itemId && next[i].count < def.maxStack) {
-          const space = def.maxStack - next[i].count;
-          const toAdd = Math.min(remaining, space);
-          next[i] = { ...next[i], count: next[i].count + toAdd };
-          remaining -= toAdd;
-          if (remaining <= 0) break;
-        }
-      }
-
-      // 2. Put into empty slots
-      if (remaining > 0) {
-        for (let i = 0; i < next.length; i++) {
-          if (next[i].itemId === null || next[i].count === 0) {
-            const toAdd = Math.min(remaining, def.maxStack);
-            next[i] = { itemId, count: toAdd };
-            remaining -= toAdd;
-            if (remaining <= 0) break;
-          }
-        }
-      }
-
+  // Input and item transactions share one state, including the save snapshot.
+  const miningHintRef = useRef('');
+  const resetControls = useCallback(() => {
+    primaryHeldRef.current = false;
+    touchMoveRef.current = { x: 0, z: 0 };
+    miningHintRef.current = '';
+    const refs = threeRefs.current;
+    if (!refs) return;
+    Object.assign(refs.moveState, { forward: false, backward: false, left: false, right: false, jump: false, sprint: false });
+    refs.breakProgress.pos = null;
+    refs.breakProgress.timer = 0;
+    refs.world.setCrackStage(null, -1);
+  }, []);
+  const beginPlay = useCallback(() => {
+    const refs = threeRefs.current;
+    const canvas = canvasRef.current;
+    if (!refs || !canvas || !persistenceRef.current.initialized) return;
+    try { sound.unlock(); } catch { setItemMessage('音声を開始できませんでした。操作は続けられます。'); }
+    if (touchEnabledRef.current) { setItemMessage(''); setPlaying(true); }
+    else {
+      const failed = () => setItemMessage('視点操作を開始できません。「タッチ操作」をONにするとドラッグでも操作できます。');
+      try { void Promise.resolve(canvas.requestPointerLock()).catch(failed); } catch { failed(); }
+    }
+  }, []);
+  const openMenu = useCallback((menu: string) => {
+    resetControls(); setPlaying(false);
+    threeRefs.current?.controls.unlock();
+    setModal(menu); setItemMessage('');
+  }, []);
+  const handlePickupItem = useCallback((itemId: string, count: number, durability?: number): number => {
+    const result = insertStack(itemsRef.current.inventory, stack(itemId, count, durability));
+    if (result.accepted) {
+      updateItems(state => ({ ...state, inventory: result.inventory }));
       if (itemId === 'wood') unlockAchievement('wood');
       if (itemId === 'iron_ingot') unlockAchievement('iron');
-
-      return remaining < count ? next : prev;
-    });
-    return true;
-  }, [unlockAchievement]);
-
-  // Close modal and return cursor item to inventory
-  const closeModalAndLock = useCallback(() => {
-    if (cursorItemRef.current && cursorItemRef.current.itemId) {
-      handlePickupItem(cursorItemRef.current.itemId, cursorItemRef.current.count);
-      setCursorItem(null);
     }
-    setOpenModal(null);
-    threeRefs.current?.controls.lock();
-  }, [handlePickupItem]);
+    return result.accepted;
+  }, [unlockAchievement]);
+  const closeMenu = useCallback(() => {
+    const next = updateItems(returnCursor);
+    setItemMessage(next.cursorItem ? '所持品が満杯です。持ち運び中の品は保持しています。' : '');
+    setModal(null);
+    void saveCurrentGame();
+    beginPlay();
+  }, []);
+
+  useEffect(() => {
+    const pause = () => { resetControls(); setPlaying(false); threeRefs.current?.controls.unlock(); };
+    const hidden = () => { if (document.hidden) pause(); };
+    const failed = () => { setPlaying(false); setItemMessage('視点操作を開始できません。「タッチ操作」をONにするとマウスのドラッグでも操作できます。'); };
+    window.addEventListener('blur', pause);
+    document.addEventListener('visibilitychange', hidden);
+    document.addEventListener('pointerlockerror', failed);
+    return () => {
+      window.removeEventListener('blur', pause);
+      document.removeEventListener('visibilitychange', hidden);
+      document.removeEventListener('pointerlockerror', failed);
+    };
+  }, []);
 
   // Player damage handler
   const handlePlayerDamage = useCallback(
     (dmg: number, source: string) => {
-      if (gameMode === 'creative') return;
+      if (gameModeRef.current === 'creative') return;
       const refs = threeRefs.current;
       if (!refs) return;
 
@@ -494,9 +664,12 @@ export default function App() {
     if (moveState.backward) inputVec.sub(forward);
     if (moveState.right) inputVec.add(right);
     if (moveState.left) inputVec.sub(right);
+    inputVec.addScaledVector(forward, -touchMoveRef.current.z);
+    inputVec.addScaledVector(right, touchMoveRef.current.x);
 
     if (inputVec.lengthSq() > 0) {
-      inputVec.normalize();
+      const strength = Math.min(1, inputVec.length());
+      inputVec.normalize().multiplyScalar(strength);
       const accel = inWater ? 6.0 : 10.0;
       player.velocity.x += inputVec.x * speed * accel * delta;
       player.velocity.z += inputVec.z * speed * accel * delta;
@@ -507,6 +680,12 @@ export default function App() {
         // Drain tiny hunger on move
         setHunger((h) => Math.max(0, h - delta * 0.08));
       }
+    }
+
+    if (player.flying) player.velocity.y = moveState.jump ? 8 : moveState.sprint ? -8 : 0;
+    else if (!inWater && moveState.jump && player.onGround) {
+      player.velocity.y = 8.8;
+      setHunger(h => Math.max(0, h - 0.08));
     }
 
     // Direct translation in world coordinates
@@ -607,7 +786,7 @@ export default function App() {
 
     // 6. Update Mobs & Spawns
     mobManager.update(delta, camera.position, handlePlayerDamage, handlePickupItem, isNight);
-    mobManager.handleSpawning(camera.position, isNight, peaceful);
+    mobManager.handleSpawning(camera.position, isNight, saveUiRef.current.settings.peaceful);
 
     // 7. Raycasting for Target Block / Face
     updateTargetBlock(refs);
@@ -644,14 +823,15 @@ export default function App() {
   // Input Event Listeners (Keyboard & Mouse)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (!persistenceRef.current.initialized) return;
+      if (e.repeat && ['KeyE', 'KeyF', 'Escape'].includes(e.code)) return;
       // Toggle inventory with 'E'
       if (e.code === 'KeyE') {
         e.preventDefault();
         if (openModal) {
-          closeModalAndLock();
+          closeMenu();
         } else {
-          threeRefs.current?.controls.unlock();
-          setOpenModal('inventory');
+          openMenu('inventory');
         }
         return;
       }
@@ -659,15 +839,15 @@ export default function App() {
       // Escape to open Settings
       if (e.code === 'Escape') {
         if (openModal) {
-          closeModalAndLock();
+          closeMenu();
         } else {
-          setOpenModal('settings');
+          openMenu('settings');
         }
         return;
       }
 
       const refs = threeRefs.current;
-      if (!refs || !refs.controls.isLocked) return;
+      if (!refs || !playingRef.current || openModalRef.current) return;
 
       const { moveState, player } = refs;
       switch (e.code) {
@@ -684,24 +864,15 @@ export default function App() {
           moveState.right = true;
           break;
         case 'ShiftLeft':
-          if (player.flying) {
-            player.velocity.y = -8;
-          } else {
-            moveState.sprint = true;
-          }
+          moveState.sprint = true;
           break;
         case 'Space':
           moveState.jump = true;
-          if (player.flying) {
-            player.velocity.y = 8;
-          } else if (player.onGround) {
-            player.velocity.y = 8.8;
-            setHunger((h) => Math.max(0, h - 0.08));
-          }
+
           break;
         case 'KeyF':
           // Toggle flight in Creative mode
-          if (gameMode === 'creative') {
+          if (gameModeRef.current === 'creative') {
             player.flying = !player.flying;
             player.velocity.y = 0;
           }
@@ -716,7 +887,7 @@ export default function App() {
         case 'Digit7':
         case 'Digit8':
         case 'Digit9':
-          setActiveSlot(parseInt(e.key) - 1);
+          selectSlot(Number(e.code.slice(-1)) - 1);
           break;
       }
     };
@@ -754,11 +925,8 @@ export default function App() {
     };
 
     const handleWheel = (e: WheelEvent) => {
-      if (!threeRefs.current?.controls.isLocked) return;
-      setActiveSlot((prev) => {
-        if (e.deltaY > 0) return (prev + 1) % 9;
-        return (prev - 1 + 9) % 9;
-      });
+      if (!playingRef.current) return;
+      selectSlot((activeSlotRef.current + (e.deltaY > 0 ? 1 : 8)) % 9);
     };
 
     window.addEventListener('keydown', handleKeyDown);
@@ -772,378 +940,211 @@ export default function App() {
     };
   }, [openModal, gameMode]);
 
-  // Mouse Interaction (Mining, Placing, Attacking, Eating, Bow) attached to window
-  useEffect(() => {
-    const handleDocumentMouseDown = (e: MouseEvent) => {
-      const refs = threeRefs.current;
-      if (!refs || !refs.controls.isLocked) return;
+  const selectSlot = (index: number) => {
+    activeSlotRef.current = index;
+    setActiveSlot(index);
+    const progress = threeRefs.current?.breakProgress;
+    if (progress) { progress.pos = null; progress.timer = 0; }
+  };
 
-      const { camera, world, mobManager } = refs;
-      const currentSlotIdx = activeSlotRef.current;
-      const currentItemSlot = inventoryRef.current[currentSlotIdx];
-      const currentItem = currentItemSlot?.itemId ? ITEMS[currentItemSlot.itemId] : null;
+  const handleReturnCursor = () => {
+    const next = updateItems(returnCursor);
+    setItemMessage(next.cursorItem ? '空きが足りません。残りの品は持ったまま保持しています。' : '所持品へ戻しました。');
+  };
+  const handleSlotClick = (index: number) => {
+    updateItems(state => clickInventory(state, index)); sound.playPop(); setItemMessage('');
+  };
+  const handleCraftGridClick = (row: number, col: number, size: 2 | 3) => {
+    const before = itemsRef.current;
+    const next = updateItems(state => clickCraftCell(state, row, col, size, activeSlotRef.current));
+    setItemMessage(next === before ? '材料を持って配置してください。道具は材料枠に入れられません。交換する材料の空きも必要です。' : '');
+    if (next !== before) sound.playPop();
+  };
+  const handleCraftTakeResult = (size: 2 | 3) => {
+    const before = itemsRef.current;
+    const result = matchRecipe(size === 2 ? before.craft2x2 : before.craft3x3, size)?.result;
+    const next = updateItems(state => craftGrid(state, size));
+    if (!result) { setItemMessage('材料の配置がレシピに一致していません。'); return; }
+    if (next === before) { setItemMessage('完成品を入れる空きがありません。材料はそのまま残しています。'); return; }
+    sound.playCraft(); setItemMessage('制作しました。');
+    if (result.itemId === 'crafting_table') unlockAchievement('workbench');
+  };
+  const handleQuickCraft = (id: string) => {
+    const recipe = CRAFTING_RECIPES.find(r => r.id === id);
+    if (!recipe || recipe.gridSize > (openModalRef.current === 'workbench' ? 3 : 2)) return;
+    const result = quickCraft(itemsRef.current.inventory, recipe, gameModeRef.current === 'creative');
+    if (result.reason) { setItemMessage(result.reason); return; }
+    updateItems(state => ({ ...state, inventory: result.inventory }));
+    setItemMessage(`${recipe.name}を制作しました。`); sound.playCraft();
+    if (id === 'crafting_table') unlockAchievement('workbench');
+  };
+  const handleFurnaceSlot = (kind: 'input' | 'fuel' | 'output') => {
+    if (!activeFurnaceKey) return;
+    const before = itemsRef.current;
+    const next = updateItems(state => kind === 'output' ? collectFurnace(state, activeFurnaceKey) : clickFurnaceSlot(state, activeFurnaceKey, kind));
+    setItemMessage(next === before ? kind === 'output' ? '回収できません。完成品や所持品の空きを確認してください。' : '所持品を持って、材料には精錬できる品、燃料には石炭・原木・木材・棒を入れてください。' : '');
+    if (next !== before) sound.playPop();
+    if (kind === 'output' && next !== before) unlockAchievement('furnace');
+    if (kind === 'output' && next !== before && next.inventory.some(slot => slot.itemId === 'iron_ingot')) unlockAchievement('iron');
+  };
 
-      const lookDir = new THREE.Vector3();
-      camera.getWorldDirection(lookDir);
-
-      // Right-Click Eating Food
-      if (e.button === 2 && currentItem?.foodRestore) {
-        sound.playEat();
-        setHealth((h) => Math.min(20, h + currentItem.foodRestore!.health));
-        setHunger((u) => Math.min(20, u + currentItem.foodRestore!.hunger));
-        if (gameModeRef.current !== 'creative') {
-          setInventory((prev) => {
-            const next = [...prev];
-            next[currentSlotIdx] = {
-              ...next[currentSlotIdx],
-              count: next[currentSlotIdx].count - 1,
-              itemId: next[currentSlotIdx].count - 1 <= 0 ? null : next[currentSlotIdx].itemId,
-            };
-            return next;
-          });
-        }
+  const useItemAction = useCallback(() => {
+    const refs = threeRefs.current;
+    if (!refs || !playingRef.current || openModalRef.current) return;
+    const index = activeSlotRef.current;
+    const slot = itemsRef.current.inventory[index];
+    const item = slot.itemId ? ITEMS[slot.itemId] : null;
+    const creative = gameModeRef.current === 'creative';
+    const { camera, world, mobManager } = refs;
+    const consume = (slotIndex: number) => updateItems(state => {
+      const inventory = state.inventory.slice(); inventory[slotIndex] = consumeSlot(inventory[slotIndex]);
+      return { ...state, inventory };
+    });
+    const direction = camera.getWorldDirection(new THREE.Vector3());
+    const hit = world.raycast(camera.position, direction, 5.5);
+    if (hit) {
+      const def = BLOCK_DEFS[hit.blockId];
+      if (def.isInteractive === 'crafting_table') { openMenu('workbench'); return; }
+      if (def.isInteractive === 'furnace') {
+        const key = world.getKey(hit.blockPos.x, hit.blockPos.y, hit.blockPos.z);
+        updateItems(state => ensureFurnace(state, key)); setActiveFurnaceKey(key);
+        openMenu('furnace'); return;
+      }
+      if (def.isInteractive === 'chest') { setItemMessage('チェストの保管画面は今後の実装項目です。'); return; }
+      if (def.isInteractive === 'bed') {
+        if (refs.isNight) { refs.timeOfDay = Math.PI * 0.45; setHealth(20); unlockAchievement('bed'); sound.playCraft(); }
         return;
       }
-
-      // Right-Click Shooting Bow
-      if (e.button === 2 && currentItem?.toolType === 'bow') {
-        const arrowSlotIdx = inventoryRef.current.findIndex((s) => s.itemId === 'arrow' && s.count > 0);
-        if (arrowSlotIdx !== -1 || gameModeRef.current === 'creative') {
-          mobManager.shootArrow(
-            camera.position.clone().add(lookDir.clone().multiplyScalar(0.5)),
-            lookDir,
-            true,
-            26
-          );
-
-          if (gameModeRef.current !== 'creative') {
-            setInventory((prev) => {
-              const next = [...prev];
-              next[arrowSlotIdx] = {
-                ...next[arrowSlotIdx],
-                count: next[arrowSlotIdx].count - 1,
-                itemId: next[arrowSlotIdx].count - 1 <= 0 ? null : 'arrow',
-              };
-              return next;
-            });
-          }
-          return;
-        }
+    }
+    if (item?.foodRestore && slot.count > 0) {
+      if (!creative) consume(index);
+      setHealth(h => Math.min(20, h + item.foodRestore!.health));
+      setHunger(h => Math.min(20, h + item.foodRestore!.hunger)); sound.playEat(); return;
+    }
+    if (item?.toolType === 'bow') {
+      const arrowIndex = itemsRef.current.inventory.findIndex(s => s.itemId === 'arrow' && s.count > 0);
+      if (!creative && arrowIndex < 0) { setItemMessage('矢がありません。'); return; }
+      if (!creative) {
+        updateItems(state => {
+          const inventory = wearTool(state.inventory, index).slice();
+          inventory[arrowIndex] = consumeSlot(inventory[arrowIndex]); return { ...state, inventory };
+        });
       }
-
-      // 1. Check if aiming at a Mob first
-      const raycaster = new THREE.Raycaster();
-      raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
-      const mobMeshes = mobManager.mobs.map((m) => m.mesh);
-      const mobIntersects = raycaster.intersectObjects(mobMeshes, true);
-
-      // 2. Check voxel raycast via DDA
-      const voxelHit = world.raycast(camera.position, lookDir, 5.5);
-
-      const hitMobObject = mobIntersects.length > 0 && mobIntersects[0].distance < 5.0 ? mobIntersects[0] : null;
-
-      // Decide whether mob is hit before block
-      if (hitMobObject && (!voxelHit || hitMobObject.distance < voxelHit.distance)) {
-        if (e.button === 0) {
-          // Left click attack mob
-          const hitMob = mobManager.mobs.find((m) => {
-            let cur: THREE.Object3D | null = hitMobObject.object;
-            while (cur) {
-              if (cur === m.mesh) return true;
-              cur = cur.parent;
-            }
-            return false;
-          });
-
-          if (hitMob) {
-            sound.playSwing();
-            const baseDmg = currentItem?.damage || 1;
-            const dir = hitMob.position.clone().sub(camera.position).normalize();
-            const killed = mobManager.hurtMob(hitMob, baseDmg, dir);
-            if (killed && hitMob.isHostile) {
-              unlockAchievement('hunter');
-            }
-            return;
-          }
-        }
-      }
-
-      // If no mob hit, process voxel block
-      if (!voxelHit) return;
-
-      const { blockPos, normal, blockId } = voxelHit;
-      const bx = blockPos.x;
-      const by = blockPos.y;
-      const bz = blockPos.z;
-
-      // LEFT CLICK: Break block or prime TNT
-      if (e.button === 0) {
-        sound.playHitBlock();
-
-        if (blockId === BLOCKS.TNT) {
-          world.removeBlock(bx, by, bz, true);
-          sound.playCreeperHiss();
-          setTimeout(() => {
-            world.explode(bx, by, bz, 4.0);
-            unlockAchievement('tnt');
-          }, 1500);
-          return;
-        }
-
-        const def = BLOCK_DEFS[blockId];
-        const removed = world.removeBlock(bx, by, bz, true);
-        if (removed) {
-          sound.playBreakBlock();
-          world.setCrackStage(null, -1);
-
-          // Drops logic
-          if (def && gameModeRef.current !== 'creative') {
-            for (const drop of def.drops) {
-              if (!drop.chance || Math.random() < drop.chance) {
-                mobManager.spawnDroppedItem(
-                  drop.itemId,
-                  drop.count,
-                  new THREE.Vector3(bx + 0.5, by + 0.5, bz + 0.5)
-                );
-              }
-            }
-          }
-
-          if (removed === BLOCKS.STONE) unlockAchievement('pickaxe');
-          if (removed === BLOCKS.WOOD) unlockAchievement('wood');
-        }
-      }
-
-      // RIGHT CLICK: Place block or interact
-      else if (e.button === 2) {
-        const def = BLOCK_DEFS[blockId];
-
-        // Interactive blocks (Crafting table, furnace, chest, bed)
-        if (def?.isInteractive) {
-          if (def.isInteractive === 'crafting_table') {
-            refs.controls.unlock();
-            setOpenModal('workbench');
-            unlockAchievement('workbench');
-            return;
-          } else if (def.isInteractive === 'furnace') {
-            refs.controls.unlock();
-            setOpenModal('furnace');
-            unlockAchievement('furnace');
-            return;
-          } else if (def.isInteractive === 'chest') {
-            refs.controls.unlock();
-            setOpenModal('chest');
-            return;
-          } else if (def.isInteractive === 'bed') {
-            if (refs.isNight) {
-              // Sleep until dawn
-              sound.playCraft();
-              refs.timeOfDay = Math.PI * 0.45; // Morning
-              setHealth(20);
-              unlockAchievement('bed');
-            }
-            return;
-          }
-        }
-
-        // Place block from active hotbar slot
-        if (currentItem?.isBlock && currentItem.blockType) {
-          const placePos = blockPos.clone().add(normal);
-
-          // Check intersection with player box
-          const pRadius = refs.player.radius;
-          const pHeight = refs.player.height;
-          const playerBoxMin = camera.position.clone().sub(new THREE.Vector3(pRadius, pHeight, pRadius));
-          const playerBoxMax = camera.position.clone().add(new THREE.Vector3(pRadius, 0.1, pRadius));
-
-          const blockBoxMin = placePos.clone();
-          const blockBoxMax = placePos.clone().addScalar(1);
-
-          const intersectsPlayer =
-            playerBoxMin.x < blockBoxMax.x &&
-            playerBoxMax.x > blockBoxMin.x &&
-            playerBoxMin.y < blockBoxMax.y &&
-            playerBoxMax.y > blockBoxMin.y &&
-            playerBoxMin.z < blockBoxMax.z &&
-            playerBoxMax.z > blockBoxMin.z;
-
-          if (!intersectsPlayer) {
-            world.addBlock(placePos.x, placePos.y, placePos.z, currentItem.blockType as BlockId);
-            sound.playPlaceBlock();
-
-            if (gameModeRef.current !== 'creative') {
-              setInventory((prev) => {
-                const next = [...prev];
-                next[currentSlotIdx] = {
-                  ...next[currentSlotIdx],
-                  count: next[currentSlotIdx].count - 1,
-                  itemId: next[currentSlotIdx].count - 1 <= 0 ? null : next[currentSlotIdx].itemId,
-                };
-                return next;
-              });
-            }
-          }
-        }
-      }
-    };
-
-    window.addEventListener('mousedown', handleDocumentMouseDown);
-    const handleContextMenu = (e: MouseEvent) => e.preventDefault();
-    window.addEventListener('contextmenu', handleContextMenu);
-
-    return () => {
-      window.removeEventListener('mousedown', handleDocumentMouseDown);
-      window.removeEventListener('contextmenu', handleContextMenu);
-    };
+      mobManager.shootArrow(camera.position.clone().addScaledVector(direction, 0.5), direction, true, 26); return;
+    }
+    if (!hit || !item?.isBlock || !item.blockType || slot.count <= 0) return;
+    const place = hit.blockPos.clone().add(hit.normal);
+    if (world.getBlock(place.x, place.y, place.z) !== null) { setItemMessage('そこには置けません。アイテムは消費していません。'); return; }
+    const min = camera.position.clone().sub(new THREE.Vector3(refs.player.radius, refs.player.height, refs.player.radius));
+    const max = camera.position.clone().add(new THREE.Vector3(refs.player.radius, 0.1, refs.player.radius));
+    if (min.x < place.x + 1 && max.x > place.x && min.y < place.y + 1 && max.y > place.y && min.z < place.z + 1 && max.z > place.z) return;
+    world.addBlock(place.x, place.y, place.z, item.blockType as BlockId);
+    if (!creative) consume(index);
+    sound.playPlaceBlock();
   }, [unlockAchievement]);
 
-  // Smelting loop simulation
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setFurnaceProgress((prev) => {
-        if (!furnaceInput.itemId || furnaceInput.count <= 0) return 0;
-        const recipe = SMELTING_RECIPES.find((r) => r.input === furnaceInput.itemId);
-        if (!recipe) return 0;
-
-        if (prev >= 100) {
-          // Finish smelting 1 item
-          setFurnaceInput((inp) => ({
-            ...inp,
-            count: inp.count - 1,
-            itemId: inp.count - 1 <= 0 ? null : inp.itemId,
-          }));
-          setFurnaceOutput((out) => ({
-            itemId: recipe.output,
-            count: (out.count || 0) + 1,
-          }));
-          sound.playCraft();
-          return 0;
-        }
-        return prev + 15;
-      });
-    }, 400);
-
-    return () => clearInterval(timer);
-  }, [furnaceInput]);
-
-  // Crafting & Inventory modal handlers
-  const handleSlotClick = (slotIdx: number) => {
-    setInventory((prev) => {
-      const next = [...prev];
-      const clickedSlot = next[slotIdx];
-
-      if (!cursorItem || !cursorItem.itemId) {
-        if (clickedSlot.itemId && clickedSlot.count > 0) {
-          setCursorItem(clickedSlot);
-          next[slotIdx] = { itemId: null, count: 0 };
-          sound.playPop();
-        }
-      } else {
-        if (!clickedSlot.itemId) {
-          next[slotIdx] = cursorItem;
-          setCursorItem(null);
-          sound.playPop();
-        } else if (clickedSlot.itemId === cursorItem.itemId) {
-          const maxStack = ITEMS[cursorItem.itemId]?.maxStack || 64;
-          const space = maxStack - clickedSlot.count;
-          if (space > 0) {
-            const toAdd = Math.min(cursorItem.count, space);
-            next[slotIdx] = { ...clickedSlot, count: clickedSlot.count + toAdd };
-            const remainder = cursorItem.count - toAdd;
-            setCursorItem(remainder > 0 ? { ...cursorItem, count: remainder } : null);
-            sound.playPop();
-          } else {
-            next[slotIdx] = cursorItem;
-            setCursorItem(clickedSlot);
-            sound.playPop();
-          }
-        } else {
-          next[slotIdx] = cursorItem;
-          setCursorItem(clickedSlot);
-          sound.playPop();
-        }
-      }
-      return next;
-    });
-  };
-
-  const handleCraftGridClick = (r: number, c: number, size: 2 | 3) => {
-    const is2x2 = size === 2;
-    const grid = is2x2 ? craft2x2 : craft3x3;
-    const setGrid = is2x2 ? setCraft2x2 : setCraft3x3;
-    const currentCellItem = grid[r][c];
-
-    if (cursorItem && cursorItem.itemId) {
-      if (currentCellItem) {
-        handlePickupItem(currentCellItem, 1);
-      }
-      const newGrid = grid.map((row) => [...row]);
-      newGrid[r][c] = cursorItem.itemId;
-      setGrid(newGrid);
-
-      if (cursorItem.count > 1) {
-        setCursorItem({ ...cursorItem, count: cursorItem.count - 1 });
-      } else {
-        setCursorItem(null);
-      }
-      sound.playPop();
-    } else if (currentCellItem) {
-      setCursorItem({ itemId: currentCellItem, count: 1 });
-      const newGrid = grid.map((row) => [...row]);
-      newGrid[r][c] = null;
-      setGrid(newGrid);
-      sound.playPop();
-    } else {
-      const active = inventory[activeSlot];
-      if (active.itemId && active.count > 0) {
-        const newGrid = grid.map((row) => [...row]);
-        newGrid[r][c] = active.itemId;
-        setGrid(newGrid);
-        setInventory((prev) => {
-          const next = [...prev];
-          next[activeSlot] = {
-            ...next[activeSlot],
-            count: next[activeSlot].count - 1,
-            itemId: next[activeSlot].count - 1 <= 0 ? null : next[activeSlot].itemId,
-          };
-          return next;
-        });
-        sound.playPop();
+  const processPrimary = (delta: number, refs: NonNullable<typeof threeRefs.current>) => {
+    const { world, camera, mobManager, breakProgress: progress } = refs;
+    const cancel = () => { progress.pos = null; progress.timer = 0; world.setCrackStage(null, -1); };
+    if (!primaryHeldRef.current) { cancel(); miningHintRef.current = ''; return; }
+    const index = activeSlotRef.current;
+    const slot = itemsRef.current.inventory[index];
+    const item = slot.itemId ? ITEMS[slot.itemId] : null;
+    const direction = camera.getWorldDirection(new THREE.Vector3());
+    const hit = world.raycast(camera.position, direction, 5.5);
+    const raycaster = new THREE.Raycaster(camera.position, direction, 0, 5);
+    const mobHit = raycaster.intersectObjects(mobManager.mobs.map(m => m.mesh), true)[0];
+    if (mobHit && (!hit || mobHit.distance < hit.distance)) {
+      cancel(); miningHintRef.current = '';
+      const now = performance.now();
+      if (now - refs.lastAttackTime < 400) return;
+      const mob = mobManager.mobs.find(m => { let node: THREE.Object3D | null = mobHit.object; while (node) { if (node === m.mesh) return true; node = node.parent; } return false; });
+      if (!mob) return;
+      refs.lastAttackTime = now;
+      const killed = mobManager.hurtMob(mob, item?.damage ?? 1, mob.position.clone().sub(camera.position));
+      if (gameModeRef.current !== 'creative') updateItems(state => ({ ...state, inventory: wearTool(state.inventory, index) }));
+      if (killed && mob.isHostile) unlockAchievement('hunter');
+      sound.playSwing(); return;
+    }
+    if (!hit) { cancel(); miningHintRef.current = ''; return; }
+    const rule = miningRule(hit.blockId, slot, gameModeRef.current === 'creative');
+    if (!rule.allowed) { cancel(); miningHintRef.current = rule.reason; return; }
+    miningHintRef.current = `${BLOCK_DEFS[hit.blockId].name}を採掘中`;
+    const signature = toolSignature(index, slot);
+    if (!progress.pos?.equals(hit.blockPos) || progress.signature !== signature) {
+      progress.pos = hit.blockPos.clone(); progress.timer = 0; progress.signature = signature;
+      sound.playHitBlock();
+    }
+    progress.maxDuration = rule.seconds;
+    progress.timer += delta;
+    world.setCrackStage(hit.blockPos, Math.min(4, Math.floor(progress.timer / rule.seconds * 5)));
+    if (progress.timer + 1e-9 < rule.seconds) return;
+    const removed = world.removeBlock(hit.blockPos.x, hit.blockPos.y, hit.blockPos.z, true);
+    cancel();
+    if (!removed) return;
+    if (gameModeRef.current !== 'creative') updateItems(state => ({ ...state, inventory: wearTool(state.inventory, index) }));
+    if (removed === BLOCKS.TNT) {
+      sound.playCreeperHiss();
+      setTimeout(() => { world.explode(hit.blockPos.x, hit.blockPos.y, hit.blockPos.z, 4); unlockAchievement('tnt'); }, 1500);
+      return;
+    }
+    if (gameModeRef.current !== 'creative') {
+      for (const drop of BLOCK_DEFS[removed].drops) {
+        if (drop.chance === undefined || Math.random() < drop.chance) mobManager.spawnDroppedItem(drop.itemId, drop.count, hit.blockPos.clone().addScalar(0.5));
       }
     }
+    if (removed === BLOCKS.WOOD) unlockAchievement('wood');
+    if (removed === BLOCKS.STONE && item?.toolType === 'pickaxe') unlockAchievement('pickaxe');
+    sound.playBreakBlock();
   };
 
-  const handleCraftTakeResult = (size: 2 | 3) => {
-    const is2x2 = size === 2;
-    const result = is2x2 ? craft2x2Result : craft3x3Result;
-    const grid = is2x2 ? craft2x2 : craft3x3;
-    const setGrid = is2x2 ? setCraft2x2 : setCraft3x3;
+  const handleTouchMove = useCallback((x: number, z: number) => { touchMoveRef.current = { x, z }; }, []);
+  const handleTouchLook = useCallback((dx: number, dy: number) => {
+    const refs = threeRefs.current;
+    if (!refs || !playingRef.current) return;
+    refs.camera.rotation.order = 'YXZ';
+    refs.camera.rotation.y -= dx * 0.004;
+    refs.camera.rotation.x = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, refs.camera.rotation.x - dy * 0.004));
+  }, []);
+  const handleTouchMine = useCallback((held: boolean) => { primaryHeldRef.current = held && playingRef.current; }, []);
+  const handleTouchJump = useCallback((held: boolean) => { if (threeRefs.current) threeRefs.current.moveState.jump = held; }, []);
+  const handleTouchSprint = useCallback((held: boolean) => { if (threeRefs.current) threeRefs.current.moveState.sprint = held; }, []);
 
-    if (!result) return;
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    return bindGameMouse(canvas, window,
+      () => playingRef.current && !openModalRef.current,
+      held => { primaryHeldRef.current = held; }, useItemAction);
+  }, [useItemAction]);
 
-    // Give result to player
-    handlePickupItem(result.itemId, result.count);
-    sound.playCraft();
-
-    // Deduct 1 item from each used slot in the grid
-    const newGrid = grid.map((row) => row.map(() => null));
-    setGrid(newGrid);
-
-    if (result.itemId === 'crafting_table') unlockAchievement('workbench');
-    if (result.itemId.includes('pickaxe')) unlockAchievement('pickaxe');
-  };
 
   return (
     <div
-      className="relative w-screen h-screen overflow-hidden bg-black select-none text-white font-sans"
+      className="relative w-full h-[100dvh] overflow-hidden bg-black select-none text-white font-sans"
       onContextMenu={(e) => e.preventDefault()}
-      onMouseMove={(e) => setMousePos({ x: e.clientX, y: e.clientY })}
+      onMouseMove={(e) => { if (itemsRef.current.cursorItem && openModalRef.current && !touchEnabledRef.current) setMousePos({ x: e.clientX, y: e.clientY }); }}
     >
       {/* 3D WebGL Canvas */}
-      <canvas ref={canvasRef} className="w-full h-full block cursor-crosshair" />
+      <canvas ref={canvasRef} className="w-full h-full block cursor-crosshair touch-none" />
+
+      {storageError && (
+        <div role="alert" className="absolute bottom-36 left-4 right-4 z-30 mx-auto max-w-lg rounded-lg border border-amber-400/40 bg-neutral-950/95 p-3 text-xs text-amber-200 pointer-events-none">
+          {storageStatus}
+        </div>
+      )}
+
+      {touchEnabled && <TouchControls active={isPlaying && !openModal} onMove={handleTouchMove} onLook={handleTouchLook}
+        onMine={handleTouchMine} onJump={handleTouchJump} onSprint={handleTouchSprint} onUse={useItemAction}
+        onMenu={() => openMenu('inventory')} onPause={() => openMenu('settings')}
+        onFlight={gameMode === 'creative' ? () => { if (threeRefs.current) { threeRefs.current.player.flying = !threeRefs.current.player.flying; threeRefs.current.player.velocity.y = 0; } } : undefined} />}
+      {isPlaying && (miningView.label || itemMessage || cursorItem?.itemId) && <div role="status" className="absolute top-24 sm:top-32 left-1/2 -translate-x-1/2 z-20 pointer-events-none max-w-[90vw] rounded-lg bg-black/75 px-3 py-2 text-xs text-center text-amber-100">
+        {miningView.label || itemMessage || (cursorItem?.itemId ? `${ITEMS[cursorItem.itemId].name}×${cursorItem.count}を保持中。持ち物から戻せます。` : '')}
+        {miningView.percent > 0 && <progress aria-label="採掘の進み具合" value={miningView.percent} max={100} className="block w-40 max-w-full mt-1 accent-amber-400" />}
+      </div>}
 
       {/* Floating Dragging Cursor Item */}
-      {cursorItem && cursorItem.itemId && (
+      {cursorItem && cursorItem.itemId && openModal && !touchEnabled && (
         <div
           className="fixed pointer-events-none z-100 flex items-center justify-center -translate-x-1/2 -translate-y-1/2 drop-shadow-2xl"
           style={{ left: mousePos.x, top: mousePos.y }}
@@ -1168,7 +1169,7 @@ export default function App() {
       </div>
 
       {/* Top Left: Environment Diagnostics & Info */}
-      <div className="absolute top-4 left-4 z-20 pointer-events-none bg-black/60 backdrop-blur-md px-3.5 py-2.5 rounded-lg border border-white/10 font-mono text-xs shadow-lg space-y-1">
+      <div className={`${touchEnabled ? 'hidden' : 'hidden sm:block'} absolute top-4 left-4 z-20 pointer-events-none bg-black/60 backdrop-blur-md px-3.5 py-2.5 rounded-lg border border-white/10 font-mono text-xs shadow-lg space-y-1`}>
         <div className="flex items-center gap-2 text-emerald-400 font-bold tracking-wide">
           <Sparkles className="w-3.5 h-3.5" />
           <span>VOXELVERSE v2.0 COMPLETE</span>
@@ -1189,7 +1190,7 @@ export default function App() {
       </div>
 
       {/* Top Right: Utility Buttons & Mode Indicator */}
-      <div className="absolute top-4 right-4 z-20 flex items-center gap-2">
+      <div className="hidden sm:flex absolute top-[max(1rem,env(safe-area-inset-top))] right-[max(1rem,env(safe-area-inset-right))] z-20 items-center gap-2">
         <div className="bg-black/60 backdrop-blur-md px-3 py-1.5 rounded-lg border border-white/10 text-xs font-mono font-semibold uppercase text-emerald-400">
           {gameMode} MODE
         </div>
@@ -1198,27 +1199,25 @@ export default function App() {
             sound.unlock();
             setSoundEnabled(!soundEnabled);
           }}
-          className="p-2 bg-black/60 hover:bg-black/80 backdrop-blur-md rounded-lg border border-white/10 text-gray-300 hover:text-white transition"
+          className="p-3 min-w-11 min-h-11 bg-black/60 hover:bg-black/80 backdrop-blur-md rounded-lg border border-white/10 text-gray-300 hover:text-white transition"
           title="Toggle Sound"
         >
           {soundEnabled ? <Volume2 className="w-4 h-4 text-emerald-400" /> : <VolumeX className="w-4 h-4 text-rose-400" />}
         </button>
         <button
           onClick={() => {
-            threeRefs.current?.controls.unlock();
-            setOpenModal('settings');
+            openMenu('settings');
           }}
-          className="p-2 bg-black/60 hover:bg-black/80 backdrop-blur-md rounded-lg border border-white/10 text-gray-300 hover:text-white transition"
+          className="p-3 min-w-11 min-h-11 bg-black/60 hover:bg-black/80 backdrop-blur-md rounded-lg border border-white/10 text-gray-300 hover:text-white transition"
           title="Settings / Pause"
         >
           <Settings className="w-4 h-4" />
         </button>
         <button
           onClick={() => {
-            threeRefs.current?.controls.unlock();
-            setOpenModal('help');
+            openMenu('help');
           }}
-          className="p-2 bg-black/60 hover:bg-black/80 backdrop-blur-md rounded-lg border border-white/10 text-gray-300 hover:text-white transition"
+          className="p-3 min-w-11 min-h-11 bg-black/60 hover:bg-black/80 backdrop-blur-md rounded-lg border border-white/10 text-gray-300 hover:text-white transition"
           title="Help & Controls"
         >
           <HelpCircle className="w-4 h-4" />
@@ -1263,8 +1262,11 @@ export default function App() {
         </div>
       )}
 
+      {touchEnabled && <div aria-label="プレイヤーの状態" className="absolute bottom-[calc(5.25rem+env(safe-area-inset-bottom))] left-1/2 -translate-x-1/2 z-20 w-[90vw] max-w-[420px] flex justify-between rounded-lg bg-black/70 px-3 py-1 text-xs pointer-events-none">
+        <span>HP {Math.ceil(health)} / 20</span><span>満腹 {Math.ceil(hunger)} / 20</span>
+      </div>}
       {/* HUD: Hearts & Hunger Bars */}
-      <div className="absolute bottom-20 left-1/2 -translate-x-1/2 z-20 pointer-events-none w-[420px] max-w-[92vw] flex justify-between items-center px-1">
+      <div className={`${touchEnabled ? 'hidden' : 'flex'} absolute bottom-20 left-1/2 -translate-x-1/2 z-20 pointer-events-none w-[420px] max-w-[92vw] justify-between items-center px-1`}>
         {/* Health Hearts (10 Hearts) */}
         <div className="flex gap-1">
           {Array.from({ length: 10 }).map((_, i) => {
@@ -1295,17 +1297,18 @@ export default function App() {
       </div>
 
       {/* Bottom Hotbar (9 Slots) */}
-      <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex gap-1.5 p-1.5 bg-black/75 backdrop-blur-md rounded-xl border border-white/20 shadow-2xl">
+      <div className="absolute bottom-[max(1rem,env(safe-area-inset-bottom))] left-1/2 -translate-x-1/2 z-20 flex gap-1 p-1.5 max-w-[calc(100vw-1rem)] overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden touch-pan-x bg-black/75 backdrop-blur-md rounded-xl border border-white/20 shadow-2xl">
         {inventory.slice(0, 9).map((slot, idx) => {
           const isActive = idx === activeSlot;
           const item = slot.itemId ? ITEMS[slot.itemId] : null;
           const texUrl = item && threeRefs.current ? threeRefs.current.atlas.dataUrls[item.textureId] : null;
 
           return (
-            <div
+            <button
               key={idx}
-              onClick={() => setActiveSlot(idx)}
-              className={`relative w-12 h-12 rounded-lg cursor-pointer transition-all flex items-center justify-center ${
+              aria-label={`装備${idx + 1} ${item?.name ?? '空'}`}
+              onClick={() => selectSlot(idx)}
+              className={`relative shrink-0 w-11 h-12 rounded-lg cursor-pointer transition-all flex items-center justify-center ${
                 isActive
                   ? 'border-2 border-white bg-white/20 shadow-[0_0_12px_rgba(255,255,255,0.4)] scale-110 z-10'
                   : 'border border-white/10 bg-white/5 hover:bg-white/10'
@@ -1329,15 +1332,16 @@ export default function App() {
                   {slot.count}
                 </span>
               )}
-            </div>
+              {item?.durability && <span className="absolute bottom-1 left-1 right-1 h-1 bg-neutral-700"><span className="block h-full bg-emerald-400" style={{ width: `${100 * (slot.durability ?? item.durability) / item.durability}%` }} /></span>}
+            </button>
           );
         })}
       </div>
 
       {/* Start / Pause Blocker Screen */}
-      {!isLocked && !openModal && (
+      {!isPlaying && !openModal && (
         <div className="absolute inset-0 z-40 bg-black/75 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center">
-          <div className="max-w-md w-full bg-neutral-900/90 border border-white/15 p-8 rounded-2xl shadow-2xl space-y-6">
+          <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto max-w-md w-full bg-neutral-900/90 border border-white/15 p-8 rounded-2xl shadow-2xl space-y-6">
             <div className="space-y-2">
               <h1 className="text-3xl font-black tracking-wider text-emerald-400">VOXELVERSE</h1>
               <p className="text-xs text-neutral-400 font-mono">3D VOXEL SANDBOX &amp; SURVIVAL</p>
@@ -1349,19 +1353,27 @@ export default function App() {
 
             <button
               onClick={() => {
-                sound.unlock();
-                threeRefs.current?.controls.lock();
+                beginPlay();
               }}
-              className="w-full py-3.5 bg-emerald-500 hover:bg-emerald-400 text-black font-black text-sm uppercase tracking-wider rounded-xl transition shadow-lg hover:shadow-emerald-500/30 active:scale-95"
+              disabled={!isReady}
+              className="disabled:opacity-50 disabled:cursor-wait w-full py-3.5 bg-emerald-500 hover:bg-emerald-400 text-black font-black text-sm uppercase tracking-wider rounded-xl transition shadow-lg hover:shadow-emerald-500/30 active:scale-95"
             >
-              シミュレーションを開始 / 再開
+              {isReady ? 'シミュレーションを開始 / 再開' : 'ワールドを準備中…'}
             </button>
 
+            <p role="status" className={`text-xs leading-relaxed ${storageError ? 'text-amber-300' : 'text-neutral-400'}`}>
+              {storageStatus}
+            </p>
+            {cursorItem?.itemId && <p className="text-xs text-amber-300">持ち運び中のアイテムも復元しました。[E]でインベントリを開いて戻せます。</p>}
+
+            <button onClick={() => { resetControls(); setTouchEnabled(value => !value); }} className="min-h-11 px-4 rounded-lg border border-white/20 text-sm">タッチ操作: {touchEnabled ? 'ON' : 'OFF'}</button>
+            {itemMessage && <p role="status" className="text-xs text-amber-200">{itemMessage}</p>}
+            {touchEnabled && <p className="text-xs text-neutral-300">左スティックで移動、右側をドラッグで視点操作。採掘は長押し。下のホットバーは左右にスワイプできます。</p>}
             {/* Quick Controls Cheat Sheet */}
             <div className="text-xs text-neutral-400 grid grid-cols-2 gap-2 text-left bg-black/40 p-4 rounded-xl border border-white/5 font-mono">
               <div><b className="text-white">[ W A S D ]</b> 移動</div>
               <div><b className="text-white">[ SPACE ]</b> ジャンプ</div>
-              <div><b className="text-white">[ 左クリック ]</b> 破壊 / 攻撃</div>
+              <div><b className="text-white">[ 左長押し ]</b> 破壊 / 攻撃</div>
               <div><b className="text-white">[ 右クリック ]</b> 配置 / 食べる</div>
               <div><b className="text-white">[ E キー ]</b> インベントリ / クラフト</div>
               <div><b className="text-white">[ 1 - 9 ]</b> スロット選択</div>
@@ -1370,538 +1382,24 @@ export default function App() {
         </div>
       )}
 
-      {/* Inventory & 2x2 Crafting Screen (Press 'E') */}
-      {openModal === 'inventory' && (
-        <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-neutral-900 border border-white/20 p-5 rounded-2xl shadow-2xl max-w-xl w-full space-y-4 max-h-[95vh] overflow-y-auto">
-            <div className="flex justify-between items-center border-b border-white/10 pb-2.5">
-              <h2 className="text-lg font-bold text-white flex items-center gap-2">
-                <span>🎒</span> インベントリ &amp; 簡易クラフト (2x2)
-              </h2>
-              <button
-                onClick={closeModalAndLock}
-                className="text-neutral-400 hover:text-white p-1 rounded-lg hover:bg-white/10 transition-colors"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            {/* 2x2 Crafting Grid */}
-            <div className="bg-neutral-950 p-3.5 rounded-xl border border-white/10 flex items-center justify-around">
-              <div>
-                <div className="text-xs text-neutral-400 mb-1.5 font-mono flex items-center justify-between">
-                  <span>CRAFTING (2x2)</span>
-                  <span className="text-[10px] text-neutral-500">クリックで配置/回収</span>
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  {[0, 1].map((r) =>
-                    [0, 1].map((c) => {
-                      const itemId = craft2x2[r][c];
-                      const item = itemId ? ITEMS[itemId] : null;
-                      const texUrl = item && threeRefs.current ? threeRefs.current.atlas.dataUrls[item.textureId] : null;
-                      return (
-                        <div
-                          key={`${r}-${c}`}
-                          onClick={() => handleCraftGridClick(r, c, 2)}
-                          className="w-12 h-12 bg-neutral-900 border border-white/15 rounded-lg flex items-center justify-center cursor-pointer hover:border-amber-400/80 transition-all shadow-inner relative"
-                          title={item ? item.name : '材料を配置'}
-                        >
-                          {texUrl && <img src={texUrl} alt="" className="w-8 h-8 object-contain pixelated pointer-events-none" />}
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-
-              {/* Arrow */}
-              <div className="text-2xl text-neutral-500 font-bold select-none">➔</div>
-
-              {/* Crafting Result */}
-              <div>
-                <div className="text-xs text-neutral-400 mb-1.5 font-mono">RESULT (完成品)</div>
-                <div
-                  onClick={() => handleCraftTakeResult(2)}
-                  className={`w-14 h-14 bg-neutral-900 border-2 rounded-xl flex items-center justify-center relative cursor-pointer transition-all ${
-                    craft2x2Result
-                      ? 'border-emerald-400 bg-emerald-950/40 shadow-[0_0_18px_rgba(52,211,153,0.35)] hover:scale-105 active:scale-95'
-                      : 'border-white/10 cursor-not-allowed opacity-40'
-                  }`}
-                  title={craft2x2Result ? `${ITEMS[craft2x2Result.itemId]?.name} x${craft2x2Result.count}` : ''}
-                >
-                  {craft2x2Result && threeRefs.current && (
-                    <>
-                      <img
-                        src={threeRefs.current.atlas.dataUrls[ITEMS[craft2x2Result.itemId]?.textureId || 'stone']}
-                        alt=""
-                        className="w-9 h-9 object-contain pixelated pointer-events-none"
-                      />
-                      <span className="absolute bottom-1 right-1 text-xs font-bold text-emerald-300 drop-shadow">
-                        {craft2x2Result.count}
-                      </span>
-                    </>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* Quick Crafting Buttons */}
-            <div>
-              <div className="text-xs text-neutral-400 mb-1 font-mono">QUICK RECIPES (クリックで即時制作)</div>
-              <div className="flex flex-wrap gap-1.5 max-h-20 overflow-y-auto pr-1">
-                {CRAFTING_RECIPES.filter((r) => r.gridSize === 2).map((rec) => {
-                  const resItem = ITEMS[rec.result.itemId];
-                  const texUrl = resItem && threeRefs.current ? threeRefs.current.atlas.dataUrls[resItem.textureId] : null;
-                  return (
-                    <button
-                      key={rec.id}
-                      onClick={() => handlePickupItem(rec.result.itemId, rec.result.count)}
-                      className="flex items-center gap-1.5 px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 active:scale-95 border border-white/10 rounded-lg text-xs transition-all"
-                    >
-                      {texUrl && <img src={texUrl} alt="" className="w-4 h-4 object-contain pixelated" />}
-                      <span>{rec.name}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Backpack Inventory (27 slots: 9 to 35) */}
-            <div>
-              <div className="text-xs text-neutral-400 mb-1 font-mono flex items-center justify-between">
-                <span>BACKPACK (バックパック 27枠)</span>
-                <span className="text-[10px] text-neutral-500">クリックでアイテム移動</span>
-              </div>
-              <div className="grid grid-cols-9 gap-1 bg-neutral-950 p-2 rounded-xl border border-white/10">
-                {inventory.slice(9, 36).map((slot, i) => {
-                  const slotIdx = 9 + i;
-                  const item = slot.itemId ? ITEMS[slot.itemId] : null;
-                  const texUrl = item && threeRefs.current ? threeRefs.current.atlas.dataUrls[item.textureId] : null;
-                  return (
-                    <div
-                      key={slotIdx}
-                      onClick={() => handleSlotClick(slotIdx)}
-                      className="w-10 h-10 bg-neutral-900 border border-white/10 rounded-lg flex items-center justify-center relative hover:border-amber-400/80 cursor-pointer transition-all shadow-inner"
-                      title={item ? `${item.name} (${slot.count})` : ''}
-                    >
-                      {texUrl && <img src={texUrl} alt="" className="w-6 h-6 object-contain pixelated pointer-events-none" />}
-                      {slot.count > 1 && (
-                        <span className="absolute bottom-0 right-0.5 text-[10px] font-bold text-white drop-shadow">
-                          {slot.count}
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Hand / Hotbar Inventory (9 slots: 0 to 8) - 手持ちアイテム */}
-            <div>
-              <div className="text-xs text-amber-400 mb-1 font-mono flex items-center justify-between font-bold">
-                <span>✋ 手持ちアイテム (HOTBAR 1〜9)</span>
-                <span className="text-[10px] text-neutral-400 font-normal">数字キー [1-9] またはクリックで装備</span>
-              </div>
-              <div className="grid grid-cols-9 gap-1 bg-neutral-950/90 p-2 rounded-xl border-2 border-amber-500/40">
-                {inventory.slice(0, 9).map((slot, slotIdx) => {
-                  const item = slot.itemId ? ITEMS[slot.itemId] : null;
-                  const texUrl = item && threeRefs.current ? threeRefs.current.atlas.dataUrls[item.textureId] : null;
-                  const isActive = activeSlot === slotIdx;
-                  return (
-                    <div
-                      key={slotIdx}
-                      onClick={() => {
-                        setActiveSlot(slotIdx);
-                        handleSlotClick(slotIdx);
-                      }}
-                      className={`w-10 h-10 rounded-lg flex items-center justify-center relative cursor-pointer transition-all shadow-inner ${
-                        isActive
-                          ? 'bg-amber-950/60 border-2 border-amber-400 ring-2 ring-amber-400/30'
-                          : 'bg-neutral-900 border border-white/15 hover:border-amber-400/80'
-                      }`}
-                      title={item ? `[${slotIdx + 1}] ${item.name} (${slot.count})` : `[${slotIdx + 1}] 空き`}
-                    >
-                      <span className="absolute top-0.5 left-1 text-[8px] font-mono text-neutral-500 pointer-events-none">
-                        {slotIdx + 1}
-                      </span>
-                      {texUrl && <img src={texUrl} alt="" className="w-6 h-6 object-contain pixelated pointer-events-none" />}
-                      {slot.count > 1 && (
-                        <span className="absolute bottom-0 right-0.5 text-[10px] font-bold text-white drop-shadow">
-                          {slot.count}
-                        </span>
-                      )}
-                      {isActive && (
-                        <span className="absolute -bottom-2 px-1 bg-amber-400 text-black text-[8px] font-black rounded-full pointer-events-none">
-                          手持
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 3x3 Workbench Crafting Screen */}
-      {openModal === 'workbench' && (
-        <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-neutral-900 border border-white/20 p-5 rounded-2xl shadow-2xl max-w-xl w-full space-y-4 max-h-[95vh] overflow-y-auto">
-            <div className="flex justify-between items-center border-b border-white/10 pb-2.5">
-              <h2 className="text-lg font-bold text-white flex items-center gap-2">
-                <span>🛠️</span> 作業台 (3x3 クラフト)
-              </h2>
-              <button
-                onClick={closeModalAndLock}
-                className="text-neutral-400 hover:text-white p-1 rounded-lg hover:bg-white/10 transition-colors"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            {/* 3x3 Grid & Output */}
-            <div className="bg-neutral-950 p-3.5 rounded-xl border border-white/10 flex items-center justify-around">
-              <div>
-                <div className="text-xs text-neutral-400 mb-1.5 font-mono flex items-center justify-between">
-                  <span>CRAFTING (3x3)</span>
-                  <span className="text-[10px] text-neutral-500">クリックで配置/回収</span>
-                </div>
-                <div className="grid grid-cols-3 gap-1.5">
-                  {[0, 1, 2].map((r) =>
-                    [0, 1, 2].map((c) => {
-                      const itemId = craft3x3[r][c];
-                      const item = itemId ? ITEMS[itemId] : null;
-                      const texUrl = item && threeRefs.current ? threeRefs.current.atlas.dataUrls[item.textureId] : null;
-                      return (
-                        <div
-                          key={`${r}-${c}`}
-                          onClick={() => handleCraftGridClick(r, c, 3)}
-                          className="w-11 h-11 bg-neutral-900 border border-white/15 rounded-lg flex items-center justify-center cursor-pointer hover:border-amber-400/80 transition-all shadow-inner relative"
-                          title={item ? item.name : '材料を配置'}
-                        >
-                          {texUrl && <img src={texUrl} alt="" className="w-7 h-7 object-contain pixelated pointer-events-none" />}
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-
-              <div className="text-2xl text-neutral-500 font-bold select-none">➔</div>
-
-              <div>
-                <div className="text-xs text-neutral-400 mb-1.5 font-mono">RESULT (完成品)</div>
-                <div
-                  onClick={() => handleCraftTakeResult(3)}
-                  className={`w-16 h-16 bg-neutral-900 border-2 rounded-xl flex items-center justify-center relative cursor-pointer transition-all ${
-                    craft3x3Result
-                      ? 'border-emerald-400 bg-emerald-950/40 shadow-[0_0_18px_rgba(52,211,153,0.35)] hover:scale-105 active:scale-95'
-                      : 'border-white/10 cursor-not-allowed opacity-40'
-                  }`}
-                  title={craft3x3Result ? `${ITEMS[craft3x3Result.itemId]?.name} x${craft3x3Result.count}` : ''}
-                >
-                  {craft3x3Result && threeRefs.current && (
-                    <>
-                      <img
-                        src={threeRefs.current.atlas.dataUrls[ITEMS[craft3x3Result.itemId]?.textureId || 'stone']}
-                        alt=""
-                        className="w-10 h-10 object-contain pixelated pointer-events-none"
-                      />
-                      <span className="absolute bottom-1 right-1 text-xs font-bold text-emerald-300 drop-shadow">
-                        {craft3x3Result.count}
-                      </span>
-                    </>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* Quick 3x3 Recipe Shortcuts */}
-            <div>
-              <div className="text-xs text-neutral-400 mb-1 font-mono">RECIPE BOOK (ワンクリックで即作成)</div>
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-28 overflow-y-auto pr-1">
-                {CRAFTING_RECIPES.map((rec) => {
-                  const resItem = ITEMS[rec.result.itemId];
-                  const texUrl = resItem && threeRefs.current ? threeRefs.current.atlas.dataUrls[resItem.textureId] : null;
-                  return (
-                    <button
-                      key={rec.id}
-                      onClick={() => handlePickupItem(rec.result.itemId, rec.result.count)}
-                      className="flex items-center gap-1.5 p-1.5 bg-neutral-800 hover:bg-neutral-700 active:scale-95 border border-white/10 rounded-lg text-xs text-left transition-all"
-                    >
-                      {texUrl && <img src={texUrl} alt="" className="w-5 h-5 object-contain pixelated pointer-events-none" />}
-                      <span className="font-semibold truncate">{rec.name}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Backpack Inventory (27 slots: 9 to 35) */}
-            <div>
-              <div className="text-xs text-neutral-400 mb-1 font-mono flex items-center justify-between">
-                <span>BACKPACK (バックパック 27枠)</span>
-                <span className="text-[10px] text-neutral-500">クリックでアイテム移動</span>
-              </div>
-              <div className="grid grid-cols-9 gap-1 bg-neutral-950 p-2 rounded-xl border border-white/10">
-                {inventory.slice(9, 36).map((slot, i) => {
-                  const slotIdx = 9 + i;
-                  const item = slot.itemId ? ITEMS[slot.itemId] : null;
-                  const texUrl = item && threeRefs.current ? threeRefs.current.atlas.dataUrls[item.textureId] : null;
-                  return (
-                    <div
-                      key={slotIdx}
-                      onClick={() => handleSlotClick(slotIdx)}
-                      className="w-10 h-10 bg-neutral-900 border border-white/10 rounded-lg flex items-center justify-center relative hover:border-amber-400/80 cursor-pointer transition-all shadow-inner"
-                      title={item ? `${item.name} (${slot.count})` : ''}
-                    >
-                      {texUrl && <img src={texUrl} alt="" className="w-6 h-6 object-contain pixelated pointer-events-none" />}
-                      {slot.count > 1 && (
-                        <span className="absolute bottom-0 right-0.5 text-[10px] font-bold text-white drop-shadow">
-                          {slot.count}
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Hand / Hotbar Inventory (9 slots: 0 to 8) - 手持ちアイテム */}
-            <div>
-              <div className="text-xs text-amber-400 mb-1 font-mono flex items-center justify-between font-bold">
-                <span>✋ 手持ちアイテム (HOTBAR 1〜9)</span>
-                <span className="text-[10px] text-neutral-400 font-normal">数字キー [1-9] またはクリックで装備</span>
-              </div>
-              <div className="grid grid-cols-9 gap-1 bg-neutral-950/90 p-2 rounded-xl border-2 border-amber-500/40">
-                {inventory.slice(0, 9).map((slot, slotIdx) => {
-                  const item = slot.itemId ? ITEMS[slot.itemId] : null;
-                  const texUrl = item && threeRefs.current ? threeRefs.current.atlas.dataUrls[item.textureId] : null;
-                  const isActive = activeSlot === slotIdx;
-                  return (
-                    <div
-                      key={slotIdx}
-                      onClick={() => {
-                        setActiveSlot(slotIdx);
-                        handleSlotClick(slotIdx);
-                      }}
-                      className={`w-10 h-10 rounded-lg flex items-center justify-center relative cursor-pointer transition-all shadow-inner ${
-                        isActive
-                          ? 'bg-amber-950/60 border-2 border-amber-400 ring-2 ring-amber-400/30'
-                          : 'bg-neutral-900 border border-white/15 hover:border-amber-400/80'
-                      }`}
-                      title={item ? `[${slotIdx + 1}] ${item.name} (${slot.count})` : `[${slotIdx + 1}] 空き`}
-                    >
-                      <span className="absolute top-0.5 left-1 text-[8px] font-mono text-neutral-500 pointer-events-none">
-                        {slotIdx + 1}
-                      </span>
-                      {texUrl && <img src={texUrl} alt="" className="w-6 h-6 object-contain pixelated pointer-events-none" />}
-                      {slot.count > 1 && (
-                        <span className="absolute bottom-0 right-0.5 text-[10px] font-bold text-white drop-shadow">
-                          {slot.count}
-                        </span>
-                      )}
-                      {isActive && (
-                        <span className="absolute -bottom-2 px-1 bg-amber-400 text-black text-[8px] font-black rounded-full pointer-events-none">
-                          手持
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Furnace Smelting Screen */}
-      {openModal === 'furnace' && (
-        <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-neutral-900 border border-white/20 p-5 rounded-2xl shadow-2xl max-w-xl w-full space-y-4 max-h-[95vh] overflow-y-auto">
-            <div className="flex justify-between items-center border-b border-white/10 pb-2.5">
-              <h2 className="text-lg font-bold text-white flex items-center gap-2">
-                <Flame className="w-5 h-5 text-orange-500" /> かまど (精錬・調理)
-              </h2>
-              <button
-                onClick={closeModalAndLock}
-                className="text-neutral-400 hover:text-white p-1 rounded-lg hover:bg-white/10 transition-colors"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="bg-neutral-950 p-4 rounded-xl border border-white/10 flex items-center justify-around">
-              {/* Left Column: Input + Fuel */}
-              <div className="flex flex-col items-center gap-3">
-                {/* Input Slot */}
-                <div
-                  onClick={() => {
-                    const active = inventory[activeSlot];
-                    if (active.itemId) {
-                      setFurnaceInput(active);
-                    }
-                  }}
-                  className="w-13 h-13 bg-neutral-900 border border-white/20 rounded-xl flex items-center justify-center cursor-pointer relative hover:border-orange-400 shadow-inner"
-                  title="クリックで手持ちアイテムを材料にセット"
-                >
-                  {furnaceInput.itemId && threeRefs.current && (
-                    <>
-                      <img
-                        src={threeRefs.current.atlas.dataUrls[ITEMS[furnaceInput.itemId]?.textureId || 'stone']}
-                        alt=""
-                        className="w-8 h-8 object-contain pixelated pointer-events-none"
-                      />
-                      <span className="absolute bottom-1 right-1 text-xs font-bold">{furnaceInput.count}</span>
-                    </>
-                  )}
-                  {!furnaceInput.itemId && <span className="text-[10px] text-neutral-500 font-mono">材料</span>}
-                </div>
-
-                {/* Animated Flame */}
-                <Flame className={`w-5 h-5 transition-all ${furnaceProgress > 0 ? 'text-amber-400 animate-pulse' : 'text-neutral-600'}`} />
-
-                {/* Fuel Slot */}
-                <div className="w-13 h-13 bg-neutral-900 border border-white/20 rounded-xl flex items-center justify-center text-[10px] text-neutral-400 font-mono shadow-inner">
-                  🔥 燃料
-                </div>
-              </div>
-
-              {/* Progress Arrow */}
-              <div className="flex flex-col items-center gap-1">
-                <span className="text-xs text-neutral-400 font-mono">{furnaceProgress}%</span>
-                <div className="w-16 h-2 bg-neutral-800 rounded-full overflow-hidden border border-white/10">
-                  <div
-                    className="h-full bg-orange-500 transition-all duration-300"
-                    style={{ width: `${furnaceProgress}%` }}
-                  />
-                </div>
-              </div>
-
-              {/* Output Slot */}
-              <div
-                onClick={() => {
-                  if (furnaceOutput.itemId && furnaceOutput.count > 0) {
-                    handlePickupItem(furnaceOutput.itemId, furnaceOutput.count);
-                    setFurnaceOutput({ itemId: null, count: 0 });
-                  }
-                }}
-                className={`w-15 h-15 bg-neutral-900 border-2 rounded-xl flex items-center justify-center relative cursor-pointer shadow-inner ${
-                  furnaceOutput.itemId ? 'border-orange-400 bg-orange-950/30 shadow-[0_0_15px_rgba(251,146,60,0.3)]' : 'border-white/10'
-                }`}
-                title="クリックで完成品を回収"
-              >
-                {furnaceOutput.itemId && threeRefs.current && (
-                  <>
-                    <img
-                      src={threeRefs.current.atlas.dataUrls[ITEMS[furnaceOutput.itemId]?.textureId || 'stone']}
-                      alt=""
-                      className="w-10 h-10 object-contain pixelated pointer-events-none"
-                    />
-                    <span className="absolute bottom-1 right-1 text-xs font-bold text-orange-300">
-                      {furnaceOutput.count}
-                    </span>
-                  </>
-                )}
-                {!furnaceOutput.itemId && <span className="text-[10px] text-neutral-500 font-mono">成果物</span>}
-              </div>
-            </div>
-
-            <div className="text-[11px] text-neutral-400 font-mono text-center">
-              鉄鉱石 ➔ 鉄インゴット | 金鉱石 ➔ 金インゴット | 砂 ➔ ガラス | 生肉 ➔ ステーキ
-            </div>
-
-            {/* Backpack Inventory (27 slots: 9 to 35) */}
-            <div>
-              <div className="text-xs text-neutral-400 mb-1 font-mono flex items-center justify-between">
-                <span>BACKPACK (バックパック 27枠)</span>
-                <span className="text-[10px] text-neutral-500">クリックでアイテム移動</span>
-              </div>
-              <div className="grid grid-cols-9 gap-1 bg-neutral-950 p-2 rounded-xl border border-white/10">
-                {inventory.slice(9, 36).map((slot, i) => {
-                  const slotIdx = 9 + i;
-                  const item = slot.itemId ? ITEMS[slot.itemId] : null;
-                  const texUrl = item && threeRefs.current ? threeRefs.current.atlas.dataUrls[item.textureId] : null;
-                  return (
-                    <div
-                      key={slotIdx}
-                      onClick={() => handleSlotClick(slotIdx)}
-                      className="w-10 h-10 bg-neutral-900 border border-white/10 rounded-lg flex items-center justify-center relative hover:border-amber-400/80 cursor-pointer transition-all shadow-inner"
-                      title={item ? `${item.name} (${slot.count})` : ''}
-                    >
-                      {texUrl && <img src={texUrl} alt="" className="w-6 h-6 object-contain pixelated pointer-events-none" />}
-                      {slot.count > 1 && (
-                        <span className="absolute bottom-0 right-0.5 text-[10px] font-bold text-white drop-shadow">
-                          {slot.count}
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Hand / Hotbar Inventory (9 slots: 0 to 8) - 手持ちアイテム */}
-            <div>
-              <div className="text-xs text-amber-400 mb-1 font-mono flex items-center justify-between font-bold">
-                <span>✋ 手持ちアイテム (HOTBAR 1〜9)</span>
-                <span className="text-[10px] text-neutral-400 font-normal">数字キー [1-9] またはクリックで装備</span>
-              </div>
-              <div className="grid grid-cols-9 gap-1 bg-neutral-950/90 p-2 rounded-xl border-2 border-amber-500/40">
-                {inventory.slice(0, 9).map((slot, slotIdx) => {
-                  const item = slot.itemId ? ITEMS[slot.itemId] : null;
-                  const texUrl = item && threeRefs.current ? threeRefs.current.atlas.dataUrls[item.textureId] : null;
-                  const isActive = activeSlot === slotIdx;
-                  return (
-                    <div
-                      key={slotIdx}
-                      onClick={() => {
-                        setActiveSlot(slotIdx);
-                        handleSlotClick(slotIdx);
-                      }}
-                      className={`w-10 h-10 rounded-lg flex items-center justify-center relative cursor-pointer transition-all shadow-inner ${
-                        isActive
-                          ? 'bg-amber-950/60 border-2 border-amber-400 ring-2 ring-amber-400/30'
-                          : 'bg-neutral-900 border border-white/15 hover:border-amber-400/80'
-                      }`}
-                      title={item ? `[${slotIdx + 1}] ${item.name} (${slot.count})` : `[${slotIdx + 1}] 空き`}
-                    >
-                      <span className="absolute top-0.5 left-1 text-[8px] font-mono text-neutral-500 pointer-events-none">
-                        {slotIdx + 1}
-                      </span>
-                      {texUrl && <img src={texUrl} alt="" className="w-6 h-6 object-contain pixelated pointer-events-none" />}
-                      {slot.count > 1 && (
-                        <span className="absolute bottom-0 right-0.5 text-[10px] font-bold text-white drop-shadow">
-                          {slot.count}
-                        </span>
-                      )}
-                      {isActive && (
-                        <span className="absolute -bottom-2 px-1 bg-amber-400 text-black text-[8px] font-black rounded-full pointer-events-none">
-                          手持
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+      {(['inventory', 'workbench', 'furnace'] as const).map(mode => openModal === mode && (
+        <ItemMenu key={mode} mode={mode} items={items} activeSlot={activeSlot} creative={gameMode === 'creative'}
+          furnaceKey={activeFurnaceKey} textures={threeRefs.current?.atlas.dataUrls ?? {}} message={itemMessage}
+          onClose={closeMenu} onInventory={handleSlotClick} onCell={handleCraftGridClick} onCraft={handleCraftTakeResult}
+          onQuick={handleQuickCraft} onFurnace={handleFurnaceSlot} onReturnCursor={handleReturnCursor} />
+      ))}
 
       {/* Settings & Pause Modal */}
       {openModal === 'settings' && (
         <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-neutral-900 border border-white/20 p-6 rounded-2xl shadow-2xl max-w-lg w-full space-y-6">
+          <div className="bg-neutral-900 border border-white/20 p-6 rounded-2xl shadow-2xl max-w-lg w-full space-y-6 max-h-[calc(100dvh-2rem)] overflow-y-auto">
             <div className="flex justify-between items-center border-b border-white/10 pb-3">
               <h2 className="text-lg font-bold text-white flex items-center gap-2">
                 <Settings className="w-5 h-5 text-emerald-400" /> ゲーム設定 &amp; ワールド管理
               </h2>
               <button
                 onClick={() => {
-                  setOpenModal(null);
-                  threeRefs.current?.controls.lock();
+                  closeMenu();
                 }}
                 className="text-neutral-400 hover:text-white p-1"
               >
@@ -1998,6 +1496,24 @@ export default function App() {
               </div>
             </div>
 
+            <section aria-label="ワールドの保存" className="border-t border-white/10 pt-4 space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-sm font-semibold">ワールドの保存</span>
+                <button
+                  type="button"
+                  onClick={() => { void saveCurrentGame(); }}
+                  disabled={!isReady || isSaving || !persistenceRef.current.canWrite}
+                  className="min-h-11 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-sm font-bold"
+                >
+                  {isSaving ? '保存中…' : '今すぐ保存'}
+                </button>
+              </div>
+              <p role="status" className={`text-xs leading-relaxed ${storageError ? 'text-amber-300' : 'text-neutral-400'}`}>{storageStatus}</p>
+              <p className="text-[11px] text-neutral-500">同じブラウザ・同じURLで自動的に続きから再開します。保存完了を確認してから閉じてください。</p>
+              {storageError && <p role="alert" className="text-xs text-amber-300">ブラウザのデータ消去やプライベートモード終了では保存が失われる場合があります。読み込み失敗中は既存データを上書きしません。</p>}
+            </section>
+
+            <button onClick={() => { resetControls(); setTouchEnabled(value => !value); }} className="min-h-11 w-full rounded-lg border border-white/20 text-sm">タッチ操作: {touchEnabled ? 'ON' : 'OFF'}</button>
             {/* Achievements List */}
             <div className="border-t border-white/10 pt-4">
               <div className="text-xs text-neutral-400 font-mono mb-2">ACHIEVEMENTS (実績)</div>
@@ -2023,8 +1539,7 @@ export default function App() {
 
             <button
               onClick={() => {
-                setOpenModal(null);
-                threeRefs.current?.controls.lock();
+                closeMenu();
               }}
               className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 text-black font-black text-sm uppercase rounded-xl transition shadow-lg"
             >
@@ -2044,8 +1559,7 @@ export default function App() {
               </h2>
               <button
                 onClick={() => {
-                  setOpenModal(null);
-                  threeRefs.current?.controls.lock();
+                  closeMenu();
                 }}
                 className="text-neutral-400 hover:text-white p-1"
               >
@@ -2056,7 +1570,7 @@ export default function App() {
             <div className="space-y-4 text-xs text-neutral-300 leading-relaxed">
               <div className="bg-neutral-950 p-3.5 rounded-xl border border-white/10 space-y-1.5">
                 <h3 className="font-bold text-emerald-400 text-sm">💡 サバイバルの基本フロー</h3>
-                <p>1. <b>原木を採取:</b> 木を左クリックで伐採し、原木を手に入れます。</p>
+                <p>1. <b>原木を採取:</b> 木を左クリックの長押しで伐採し、原木を手に入れます。</p>
                 <p>2. <b>木材と作業台:</b> [E]キーでインベントリを開き、原木を木材に、木材4つで「作業台」を作成！</p>
                 <p>3. <b>ツルハシの作成:</b> 作業台を設置して右クリックし、木のツルハシを作って石や鉱石を採掘！</p>
                 <p>4. <b>夜への備え:</b> 夜になるとゾンビやクリーパー、スケルトンが出現します。松明で拠点を照らし、身を守りましょう。</p>
@@ -2067,7 +1581,7 @@ export default function App() {
                 <div className="grid grid-cols-2 gap-x-4 gap-y-1 font-mono text-[11px] pt-1">
                   <p><b>[ W A S D ]</b> 移動</p>
                   <p><b>[ SPACE ]</b> ジャンプ (飛翔)</p>
-                  <p><b>[ 左クリック ]</b> 破壊 / モブ攻撃</p>
+                  <p><b>[ 左長押し ]</b> 破壊 / モブ攻撃</p>
                   <p><b>[ 右クリック ]</b> ブロック配置 / 飲食</p>
                   <p><b>[ E キー ]</b> インベントリ</p>
                   <p><b>[ 1 - 9 ]</b> ホットバー選択</p>
@@ -2079,8 +1593,7 @@ export default function App() {
 
             <button
               onClick={() => {
-                setOpenModal(null);
-                threeRefs.current?.controls.lock();
+                closeMenu();
               }}
               className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 text-black font-black text-sm uppercase rounded-xl transition"
             >

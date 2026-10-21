@@ -3,6 +3,8 @@ import { BLOCKS, BLOCK_DEFS, BlockId } from './blocks';
 import { TextureAtlas } from './textures';
 import { DebrisParticle, TorchLight } from './types';
 import { sound } from './audio';
+import { worldRandom } from './worldSeed';
+import type { WorldSave } from './save';
 
 export const CHUNK_SIZE = 16;
 export const MAX_INSTANCES_PER_BLOCK = 40000;
@@ -37,9 +39,14 @@ export class VoxelWorld {
   public pendingWaterFlow: Array<{ x: number; y: number; z: number; spread: number }> = [];
   private waterFlowTimer = 0;
 
+  public seed: number;
+  public blockEdits = new Map<string, BlockId>();
+  public onBlockRemoved?: (x: number, y: number, z: number, type: BlockId) => void;
+  private generating = false;
   private dummy = new THREE.Object3D();
 
-  constructor(scene: THREE.Scene, atlas: TextureAtlas) {
+  constructor(scene: THREE.Scene, atlas: TextureAtlas, seed = Math.floor(Math.random() * 0x100000000)) {
+    this.seed = seed >>> 0;
     this.scene = scene;
     this.atlas = atlas;
 
@@ -411,79 +418,103 @@ export class VoxelWorld {
 
     const startX = cx * CHUNK_SIZE;
     const startZ = cz * CHUNK_SIZE;
+    this.generating = true;
+    try {
+      for (let x = 0; x < CHUNK_SIZE; x++) {
+        for (let z = 0; z < CHUNK_SIZE; z++) {
+          const gx = startX + x;
+          const gz = startZ + z;
+          const { height: surfaceY, biome } = this.getTerrainHeight(gx, gz);
 
-    for (let x = 0; x < CHUNK_SIZE; x++) {
-      for (let z = 0; z < CHUNK_SIZE; z++) {
-        const gx = startX + x;
-        const gz = startZ + z;
-        const { height: surfaceY, biome } = this.getTerrainHeight(gx, gz);
+          // Bedrock floor
+          this.addBlock(gx, BEDROCK_Y, gz, BLOCKS.BEDROCK, false);
 
-        // Bedrock floor
-        this.addBlock(gx, BEDROCK_Y, gz, BLOCKS.BEDROCK, false);
+          // Underground from bedrock up to surface
+          for (let y = BEDROCK_Y + 1; y < surfaceY; y++) {
+            if (this.isCave(gx, y, gz)) {
+              continue; // Open cave space
+            }
 
-        // Underground from bedrock up to surface
-        for (let y = BEDROCK_Y + 1; y < surfaceY; y++) {
-          if (this.isCave(gx, y, gz)) {
-            continue; // Open cave space
+            // Mineral ores generation
+            const rand = worldRandom(this.seed, gx, y, gz, 1);
+            if (y <= -8 && rand < 0.015) {
+              this.addBlock(gx, y, gz, BLOCKS.DIAMOND_ORE, false);
+            } else if (y <= -4 && rand < 0.03) {
+              this.addBlock(gx, y, gz, BLOCKS.GOLD_ORE, false);
+            } else if (y <= 0 && rand < 0.06) {
+              this.addBlock(gx, y, gz, BLOCKS.IRON_ORE, false);
+            } else if (rand < 0.08) {
+              this.addBlock(gx, y, gz, BLOCKS.COAL_ORE, false);
+            } else if (y >= surfaceY - 3 && biome !== 'desert') {
+              this.addBlock(gx, y, gz, BLOCKS.DIRT, false);
+            } else {
+              this.addBlock(gx, y, gz, BLOCKS.STONE, false);
+            }
           }
 
-          // Mineral ores generation
-          const rand = Math.random();
-          if (y <= -8 && rand < 0.015) {
-            this.addBlock(gx, y, gz, BLOCKS.DIAMOND_ORE, false);
-          } else if (y <= -4 && rand < 0.03) {
-            this.addBlock(gx, y, gz, BLOCKS.GOLD_ORE, false);
-          } else if (y <= 0 && rand < 0.06) {
-            this.addBlock(gx, y, gz, BLOCKS.IRON_ORE, false);
-          } else if (rand < 0.08) {
-            this.addBlock(gx, y, gz, BLOCKS.COAL_ORE, false);
-          } else if (y >= surfaceY - 3 && biome !== 'desert') {
-            this.addBlock(gx, y, gz, BLOCKS.DIRT, false);
-          } else {
-            this.addBlock(gx, y, gz, BLOCKS.STONE, false);
-          }
-        }
-
-        // Surface layer
-        if (biome === 'desert') {
-          this.addBlock(gx, surfaceY, gz, BLOCKS.SAND, false);
-          this.addBlock(gx, surfaceY - 1, gz, BLOCKS.SAND, false);
-          this.addBlock(gx, surfaceY - 2, gz, BLOCKS.SAND, false);
-
-          // Cactus (rare)
-          if (Math.random() < 0.015) {
-            this.addBlock(gx, surfaceY + 1, gz, BLOCKS.LEAVES, false);
-            this.addBlock(gx, surfaceY + 2, gz, BLOCKS.LEAVES, false);
-          }
-        } else {
-          // Grass or water body
-          if (surfaceY < -1) {
-            // Lake / Pond
+          // Surface layer
+          if (biome === 'desert') {
             this.addBlock(gx, surfaceY, gz, BLOCKS.SAND, false);
-            for (let wy = surfaceY + 1; wy <= 0; wy++) {
-              this.addBlock(gx, wy, gz, BLOCKS.WATER, false);
+            this.addBlock(gx, surfaceY - 1, gz, BLOCKS.SAND, false);
+            this.addBlock(gx, surfaceY - 2, gz, BLOCKS.SAND, false);
+
+            // Cactus (rare)
+            if (worldRandom(this.seed, gx, surfaceY, gz, 2) < 0.015) {
+              this.addBlock(gx, surfaceY + 1, gz, BLOCKS.LEAVES, false);
+              this.addBlock(gx, surfaceY + 2, gz, BLOCKS.LEAVES, false);
             }
           } else {
-            this.addBlock(gx, surfaceY, gz, BLOCKS.GRASS, false);
-            this.addBlock(gx, surfaceY - 1, gz, BLOCKS.DIRT, false);
+            // Grass or water body
+            if (surfaceY < -1) {
+              // Lake / Pond
+              this.addBlock(gx, surfaceY, gz, BLOCKS.SAND, false);
+              for (let wy = surfaceY + 1; wy <= 0; wy++) {
+                this.addBlock(gx, wy, gz, BLOCKS.WATER, false);
+              }
+            } else {
+              this.addBlock(gx, surfaceY, gz, BLOCKS.GRASS, false);
+              this.addBlock(gx, surfaceY - 1, gz, BLOCKS.DIRT, false);
 
-            // Flora: Trees or Flowers
-            const treeChance = biome === 'forest' ? 0.045 : 0.015;
-            if (Math.random() < treeChance) {
-              this.generateTree(gx, surfaceY + 1, gz);
-            } else if (Math.random() < 0.04) {
-              this.addBlock(gx, surfaceY + 1, gz, BLOCKS.FLOWER, false);
+              // Flora: Trees or Flowers
+              const treeChance = biome === 'forest' ? 0.045 : 0.015;
+              if (worldRandom(this.seed, gx, surfaceY, gz, 3) >= treeChance &&
+                worldRandom(this.seed, gx, surfaceY, gz, 4) < 0.04) {
+                this.addBlock(gx, surfaceY + 1, gz, BLOCKS.FLOWER, false);
+              }
             }
           }
         }
       }
+      // Generate only cells owned by this chunk, including canopies from neighboring trees.
+      // This avoids chunk-visit-order changing terrain or overwriting saved holes.
+      for (let gx = startX - 2; gx < startX + CHUNK_SIZE + 2; gx++) {
+        for (let gz = startZ - 2; gz < startZ + CHUNK_SIZE + 2; gz++) {
+          const { height, biome } = this.getTerrainHeight(gx, gz);
+          const chance = biome === 'forest' ? 0.045 : 0.015;
+          if (biome !== 'desert' && height >= -1 && worldRandom(this.seed, gx, height, gz, 3) < chance) {
+            this.generateTree(gx, height + 1, gz, { minX: startX, minZ: startZ });
+          }
+        }
+      }
+    } finally { this.generating = false; }
+    for (const [key, type] of this.blockEdits) {
+      if (type === BLOCKS.AIR) continue;
+      const [x, y, z] = key.split(',').map(Number);
+      if (Math.floor(x / CHUNK_SIZE) === cx && Math.floor(z / CHUNK_SIZE) === cz) {
+        this.addBlock(x, y, z, type, false);
+      }
     }
   }
 
-  public generateTree(bx: number, by: number, bz: number) {
-    const height = 4 + Math.floor(Math.random() * 2);
+  public generateTree(bx: number, by: number, bz: number, bounds?: { minX: number; minZ: number }) {
+    const place = (x: number, y: number, z: number, type: BlockId) => {
+      if (!bounds || (x >= bounds.minX && x < bounds.minX + CHUNK_SIZE && z >= bounds.minZ && z < bounds.minZ + CHUNK_SIZE)) {
+        this.addBlock(x, y, z, type, false);
+      }
+    };
+    const height = 4 + Math.floor(worldRandom(this.seed, bx, by, bz, 5) * 2);
     for (let y = 0; y < height; y++) {
-      this.addBlock(bx, by + y, bz, BLOCKS.WOOD, false);
+      place(bx, by + y, bz, BLOCKS.WOOD);
     }
     // Leaves canopy
     for (let x = -2; x <= 2; x++) {
@@ -491,7 +522,7 @@ export class VoxelWorld {
         for (let y = height - 2; y <= height + 1; y++) {
           if (Math.abs(x) + Math.abs(z) > 3 && y !== height - 1) continue;
           if (x === 0 && z === 0 && y < height) continue;
-          this.addBlock(bx + x, by + y, bz + z, BLOCKS.LEAVES, false);
+          place(bx + x, by + y, bz + z, BLOCKS.LEAVES);
         }
       }
     }
@@ -520,9 +551,10 @@ export class VoxelWorld {
     const bz = Math.floor(z);
     const key = this.getKey(bx, by, bz);
 
-    if (this.worldData.has(key)) return;
+    if (this.worldData.has(key) || (this.generating && this.blockEdits.has(key))) return;
 
     this.worldData.set(key, type);
+    if (!this.generating) this.blockEdits.set(key, type);
 
     const cx = Math.floor(bx / CHUNK_SIZE);
     const cz = Math.floor(bz / CHUNK_SIZE);
@@ -566,6 +598,8 @@ export class VoxelWorld {
     if (type === BLOCKS.BEDROCK) return null; // Unbreakable
 
     this.worldData.delete(key);
+    this.blockEdits.set(key, BLOCKS.AIR);
+    this.onBlockRemoved?.(bx, by, bz, type);
 
     const cx = Math.floor(bx / CHUNK_SIZE);
     const cz = Math.floor(bz / CHUNK_SIZE);
@@ -854,33 +888,37 @@ export class VoxelWorld {
     return destroyed;
   }
 
-  // Serialization for Save & Load
-  public exportSaveData() {
-    const blocks: { x: number; y: number; z: number; type: BlockId }[] = [];
-    for (const [key, type] of this.worldData.entries()) {
-      const [x, y, z] = key.split(',').map(Number);
-      blocks.push({ x, y, z, type });
-    }
+  // Generated terrain is reproducible; only edits (including AIR tombstones) need storage.
+  public exportSaveData(): WorldSave {
     return {
-      version: 1,
-      blocks,
+      seed: this.seed,
+      edits: Array.from(this.blockEdits, ([key, type]) => {
+        const [x, y, z] = key.split(',').map(Number);
+        return { x, y, z, type };
+      }),
     };
   }
 
-  public importSaveData(data: { blocks: { x: number; y: number; z: number; type: BlockId }[] }) {
-    // Clear current
+  // Call only with a validated snapshot, before generating the restored player's area.
+  public importSaveData(data: WorldSave) {
+    this.seed = data.seed;
+    this.blockEdits = new Map(data.edits.map(b => [this.getKey(b.x, b.y, b.z), b.type]));
     this.worldData.clear();
     this.chunkData.clear();
     this.generatedChunks.clear();
+    this.chunkRenderData.clear();
+    this.dirtyChunks.clear();
+    this.pendingWaterFlow = [];
+    this.waterFlowTimer = 0;
+    this.lastPlayerChunkX = null;
+    this.lastPlayerChunkZ = null;
     for (const torch of this.torchLights.values()) {
       this.scene.remove(torch.light);
       torch.light.dispose();
     }
     this.torchLights.clear();
-
-    for (const b of data.blocks) {
-      this.addBlock(b.x, b.y, b.z, b.type, false);
-    }
+    this.setTargetHighlight(null);
+    this.setCrackStage(null, -1);
     this.updateInstancedMeshes();
   }
 

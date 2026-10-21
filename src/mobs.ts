@@ -7,6 +7,7 @@ export interface DroppedItemEntity {
   mesh: THREE.Group;
   itemId: string;
   count: number;
+  durability?: number;
   position: THREE.Vector3;
   velocity: THREE.Vector3;
   life: number;
@@ -366,7 +367,7 @@ export class MobManager {
     return arrow;
   }
 
-  public spawnDroppedItem(itemId: string, count: number, pos: THREE.Vector3) {
+  public spawnDroppedItem(itemId: string, count: number, pos: THREE.Vector3, durability?: number) {
     const group = new THREE.Group();
     const geo = new THREE.BoxGeometry(0.35, 0.35, 0.35);
     const tex = this.world.atlas.textures[itemId] || this.world.atlas.textures['stone'];
@@ -380,6 +381,7 @@ export class MobManager {
       mesh: group,
       itemId,
       count,
+      durability,
       position: group.position,
       velocity: new THREE.Vector3((Math.random() - 0.5) * 2, 3, (Math.random() - 0.5) * 2),
       life: 180, // 3 minutes
@@ -391,7 +393,7 @@ export class MobManager {
     delta: number,
     playerPos: THREE.Vector3,
     onPlayerDamage: (dmg: number, mobType: string) => void,
-    onPickupItem: (itemId: string, count: number) => boolean,
+    onPickupItem: (itemId: string, count: number, durability?: number) => number,
     isNight: boolean
   ) {
     // 1. Update Mobs
@@ -602,13 +604,18 @@ export class MobManager {
 
       // Pickup
       if (dist < 1.3) {
-        const picked = onPickupItem(drop.itemId, drop.count);
-        if (picked) {
+        const accepted = Math.max(0, Math.min(drop.count, onPickupItem(drop.itemId, drop.count, drop.durability)));
+        if (accepted > 0) {
           sound.playPickup();
+          drop.count -= accepted;
+        }
+        if (drop.count === 0) {
           this.scene.remove(drop.mesh);
           this.droppedItems.splice(i, 1);
           continue;
         }
+        // A rejected pickup must not disappear while the player is making room nearby.
+        drop.life += delta;
       }
 
       if (drop.life <= 0) {
