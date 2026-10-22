@@ -29,6 +29,16 @@ test('a complete save round-trips without losing cursor, crafting, equipment or 
   assert.equal(input.inventory[0].count, 1, 'validated data must not alias live state');
 });
 
+test('optional graphics settings preserve old v3 saves and validate new preferences', () => {
+  const old = fixture(); assert.deepEqual(parseSave(old), old);
+  const data = fixture();
+  Object.assign(data.settings, { graphicsQuality: 'low', shadowsEnabled: false, cameraShake: false });
+  assert.deepEqual(parseSave(JSON.parse(JSON.stringify(data))), data);
+  for (const settings of [{ graphicsQuality: 'ultra' }, { shadowsEnabled: 0 }, { cameraShake: 'false' }]) {
+    assert.throws(() => parseSave({ ...old, settings: { ...old.settings, ...settings } }));
+  }
+});
+
 test('unknown versions and malformed documents are rejected, not reset', () => {
   for (const value of [null, [], {}, { ...fixture(), version: 99 }, { ...fixture(), version: '1' }]) {
     assert.throws(() => parseSave(value));

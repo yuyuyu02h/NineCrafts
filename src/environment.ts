@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { initializeClouds } from './environmentSettings';
+import { initializeClouds, updateClouds } from './environmentSettings';
 
 export class ShaderEnvironment {
   public scene: THREE.Scene;
@@ -20,6 +20,11 @@ export class ShaderEnvironment {
   public cloudMesh: THREE.InstancedMesh;
   private cloudCount = 196;
   private cloudOffset = 0;
+  private skyColor = new THREE.Color();
+  private fogColor = new THREE.Color();
+  private hemiSky = new THREE.Color();
+  private hemiGround = new THREE.Color();
+  private dirColor = new THREE.Color();
 
   // Atmospheric Particles (Pollen / Dust motes / Night Fireflies)
   public particleSystem: THREE.Points;
@@ -128,7 +133,7 @@ export class ShaderEnvironment {
     });
     this.cloudMesh = new THREE.InstancedMesh(cloudGeo, cloudMat, this.cloudCount);
     this.cloudMesh.receiveShadow = false;
-    this.cloudMesh.castShadow = true; // Clouds cast real shadows on the terrain!
+    this.cloudMesh.castShadow = true;
 
     initializeClouds(this.cloudMesh);
     this.scene.add(this.cloudMesh);
@@ -231,20 +236,16 @@ export class ShaderEnvironment {
     );
 
     // 1. Sky & Atmospheric Light Colors
-    let skyColor: THREE.Color;
-    let fogColor: THREE.Color;
-    let hemiSky: THREE.Color;
-    let hemiGround: THREE.Color;
-    let dirColor: THREE.Color;
+    const { skyColor, fogColor, hemiSky, hemiGround, dirColor } = this;
     let dirIntensity: number;
 
     if (sunY > 0.25) {
       // Crisp midday sunlight
-      skyColor = new THREE.Color().setHSL(0.58, 0.7, 0.52 + sunY * 0.12);
-      fogColor = new THREE.Color().setHSL(0.58, 0.55, 0.65 + sunY * 0.1);
-      hemiSky = new THREE.Color(0xaad5ff);
-      hemiGround = new THREE.Color(0x5a4836);
-      dirColor = new THREE.Color(0xfffaea);
+      skyColor.setHSL(0.58, 0.7, 0.52 + sunY * 0.12);
+      fogColor.setHSL(0.58, 0.55, 0.65 + sunY * 0.1);
+      hemiSky.setHex(0xaad5ff);
+      hemiGround.setHex(0x5a4836);
+      dirColor.setHex(0xfffaea);
       dirIntensity = 1.25 * sunY;
       (this.starPoints.material as THREE.PointsMaterial).opacity = 0;
       this.sunSprite.visible = true;
@@ -253,11 +254,11 @@ export class ShaderEnvironment {
     } else if (sunY > -0.15) {
       // Golden Hour / Sunset (Shader-mod cinematic orange & purple horizon)
       const t = (sunY + 0.15) / 0.4;
-      skyColor = new THREE.Color().setHSL(0.07, 0.9, 0.35 + t * 0.2);
-      fogColor = new THREE.Color().setHSL(0.05, 0.85, 0.45);
-      hemiSky = new THREE.Color(0xff8844);
-      hemiGround = new THREE.Color(0x332015);
-      dirColor = new THREE.Color(0xff8833);
+      skyColor.setHSL(0.07, 0.9, 0.35 + t * 0.2);
+      fogColor.setHSL(0.05, 0.85, 0.45);
+      hemiSky.setHex(0xff8844);
+      hemiGround.setHex(0x332015);
+      dirColor.setHex(0xff8833);
       dirIntensity = Math.max(0.4, t * 1.1);
       (this.starPoints.material as THREE.PointsMaterial).opacity = (1 - t) * 0.5;
       this.sunSprite.visible = true;
@@ -265,11 +266,11 @@ export class ShaderEnvironment {
       this.moonSprite.visible = true;
     } else {
       // Moody Moonlight Night with Starfield
-      skyColor = new THREE.Color().setHSL(0.65, 0.75, 0.035);
-      fogColor = new THREE.Color().setHSL(0.65, 0.65, 0.06);
-      hemiSky = new THREE.Color(0x1a2b4c);
-      hemiGround = new THREE.Color(0x0c0f18);
-      dirColor = new THREE.Color(0x6b8ecc);
+      skyColor.setHSL(0.65, 0.75, 0.035);
+      fogColor.setHSL(0.65, 0.65, 0.06);
+      hemiSky.setHex(0x1a2b4c);
+      hemiGround.setHex(0x0c0f18);
+      dirColor.setHex(0x6b8ecc);
       dirIntensity = 0.35;
       (this.starPoints.material as THREE.PointsMaterial).opacity = 0.85;
       this.sunSprite.visible = false;
@@ -277,9 +278,9 @@ export class ShaderEnvironment {
       this.moonSprite.visible = true;
     }
 
-    this.scene.background = skyColor;
+    if (this.scene.background instanceof THREE.Color) this.scene.background.copy(skyColor);
     if (this.scene.fog) {
-      this.scene.fog.color = fogColor;
+      this.scene.fog.color.copy(fogColor);
     }
 
     this.hemiLight.color.copy(hemiSky);
@@ -307,13 +308,9 @@ export class ShaderEnvironment {
     // Keep Starfield centered on player
     this.starPoints.position.copy(playerPos);
 
-    // 3. Update Volumetric Clouds (Translate cloud layer with wind - zero matrix re-upload)
+    // 3. Wind in world space; recycle only clouds beyond the horizon.
     this.cloudOffset += delta * 1.5;
-    this.cloudMesh.position.set(
-      playerPos.x + (this.cloudOffset % 80) - 40,
-      0,
-      playerPos.z
-    );
+    updateClouds(this.cloudMesh, this.cloudOffset, playerPos);
 
     // 4. Update Atmospheric Particles (Gentle rotation with zero buffer re-upload)
     this.particleSystem.position.copy(playerPos);

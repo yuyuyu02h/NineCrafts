@@ -6,6 +6,7 @@ import { sound } from './audio';
 import { worldRandom } from './worldSeed';
 import type { WorldSave } from './save';
 import { disposeObjects } from './resources';
+import type { Placement } from './placement';
 
 export const CHUNK_SIZE = 16;
 export const MAX_INSTANCES_PER_BLOCK = 40000;
@@ -32,6 +33,7 @@ export class VoxelWorld {
   public targetBoxMesh: THREE.LineSegments;
   // Crack overlay mesh
   public crackMesh: THREE.Mesh;
+  public placementMesh: THREE.Mesh;
 
   public renderDistance = 2; // in chunks (5x5 chunk grid, 80x80 blocks for ultra smooth 60fps)
   public lastPlayerChunkX: number | null = null;
@@ -90,6 +92,15 @@ export class VoxelWorld {
     this.crackMesh.visible = false;
     this.scene.add(this.crackMesh);
 
+    this.placementMesh = new THREE.Mesh(new THREE.BoxGeometry(1.006, 1.006, 1.006),
+      new THREE.MeshBasicMaterial({ color: 0x69f0a4, transparent: true, opacity: 0.22, depthWrite: false }));
+    const outline = new THREE.LineSegments(new THREE.EdgesGeometry(this.placementMesh.geometry),
+      new THREE.LineBasicMaterial({ color: 0x69f0a4, transparent: true, opacity: 0.95 }));
+    this.placementMesh.name = 'placement-preview';
+    this.placementMesh.add(outline);
+    this.placementMesh.visible = false;
+    this.scene.add(this.placementMesh);
+
     this.initInstancedMeshes();
   }
 
@@ -143,8 +154,11 @@ export class VoxelWorld {
 
     // Water: only occlude if water or solid block is above, below, and on all 4 sides
     if (blockType === BLOCKS.WATER) {
-      const top = this.getBlock(x, y + 1, z);
-      if (top !== BLOCKS.WATER && !this.isOpaqueSolid(top)) return false; // Water surface must render!
+      // Internal lake cells cannot be seen through other water or solid terrain.
+      const covered = (id: BlockId | null) => id === BLOCKS.WATER || this.isOpaqueSolid(id);
+      return covered(this.getBlock(x, y + 1, z)) && covered(this.getBlock(x, y - 1, z)) &&
+        covered(this.getBlock(x + 1, y, z)) && covered(this.getBlock(x - 1, y, z)) &&
+        covered(this.getBlock(x, y, z + 1)) && covered(this.getBlock(x, y, z - 1));
     }
 
     // Check top neighbor first (fast reject for 95% of surface blocks)
@@ -901,6 +915,18 @@ export class VoxelWorld {
     this.targetBoxMesh.position.set(Math.floor(pos.x) + 0.5, Math.floor(pos.y) + 0.5, Math.floor(pos.z) + 0.5);
   }
 
+  public setPlacementPreview(placement: Placement | null, type?: BlockId) {
+    this.placementMesh.visible = placement !== null;
+    if (!placement) return;
+    this.placementMesh.position.copy(placement.position).addScalar(0.5);
+    const small = type === BLOCKS.TORCH || type === BLOCKS.FLOWER;
+    this.placementMesh.scale.set(small ? (type === BLOCKS.TORCH ? 0.2 : 0.4) : 1, small ? 0.6 : 1, small ? (type === BLOCKS.TORCH ? 0.2 : 0.4) : 1);
+    if (small) this.placementMesh.position.y -= 0.2;
+    const color = placement.allowed ? 0x69f0a4 : 0xff6666;
+    (this.placementMesh.material as THREE.MeshBasicMaterial).color.setHex(color);
+    ((this.placementMesh.children[0] as THREE.LineSegments).material as THREE.LineBasicMaterial).color.setHex(color);
+  }
+
   // Trigger TNT explosion
   public explode(x: number, y: number, z: number, radius = 3.5): BlockId[] {
     sound.playExplosion();
@@ -977,7 +1003,7 @@ export class VoxelWorld {
   }
 
   public dispose() {
-    disposeObjects([...Object.values(this.instancedMeshes), this.targetBoxMesh, this.crackMesh, ...this.debrisList.map(d => d.mesh)].filter(Boolean) as THREE.Object3D[]);
+    disposeObjects([...Object.values(this.instancedMeshes), this.targetBoxMesh, this.crackMesh, this.placementMesh, ...this.debrisList.map(d => d.mesh)].filter(Boolean) as THREE.Object3D[]);
     for (const t of this.torchLights.values()) { t.light.removeFromParent(); t.light.dispose(); }
     this.torchLights.clear(); this.torchPositions.clear(); this.debrisList = [];
     this.worldData.clear(); this.chunkData.clear(); this.generatedChunks.clear(); this.chunkRenderData.clear(); this.dirtyChunks.clear();

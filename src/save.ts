@@ -1,3 +1,4 @@
+import type { GraphicsQuality } from './graphics';
 import { BLOCKS, ITEMS, type BlockId } from './blocks';
 import type { GameMode, InventorySlot } from './types';
 import { SMELTING_RECIPES } from './recipes';
@@ -42,6 +43,9 @@ export interface GameSave {
     fov: number;
     renderDist: number;
     peaceful: boolean;
+    graphicsQuality?: GraphicsQuality;
+    shadowsEnabled?: boolean;
+    cameraShake?: boolean;
   };
 }
 
@@ -114,6 +118,8 @@ export function parseSave(value: unknown): GameSave {
     !(legacy ? validFurnace(value.furnace, true) : validFurnaces(value.furnaces) && (value.legacyFurnace === null || validFurnace(value.legacyFurnace))) ||
     !isRecord(settings) || (settings.gameMode !== 'survival' && settings.gameMode !== 'creative') ||
     !numberIn(settings.fov, 60, 100) || !integerIn(settings.renderDist, 1, 4) ||
+    (settings.graphicsQuality !== undefined && !['low', 'balanced', 'high'].includes(settings.graphicsQuality as string)) ||
+    !['shadowsEnabled', 'cameraShake'].every(key => settings[key] === undefined || typeof settings[key] === 'boolean') ||
     !['soundEnabled', 'musicEnabled', 'peaceful'].every(key => typeof settings[key] === 'boolean')) {
     throw new Error('プレイヤー・所持品の保存データが壊れています。');
   }

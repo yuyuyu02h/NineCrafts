@@ -5,6 +5,7 @@ import { loadGame, saveGame, type GameStorage } from '../src/storage';
 import { initialItems, stack } from '../src/items';
 import { SAVE_VERSION, type GameSave } from '../src/save';
 import { BLOCKS } from '../src/blocks';
+import * as THREE from 'three';
 import { findSafeSpawn } from '../src/simulation';
 import { world } from './world-fixture';
 import '../src/index.css';
@@ -39,6 +40,15 @@ async function rawWrite(name: string, value: unknown) {
   finally { db.close(); }
 }
 let root: Root | undefined;
+// Observe the real renderer without adding debug hooks to the production App.
+let rendered: { renderer: THREE.WebGLRenderer; scene: THREE.Scene; camera: THREE.Camera } | undefined;
+let renderedFrames = 0;
+const beforeRender = THREE.Object3D.prototype.onBeforeRender;
+THREE.Object3D.prototype.onBeforeRender = function (renderer, scene, camera, geometry, material, group) {
+  beforeRender.call(this, renderer, scene, camera, geometry, material, group);
+  rendered = { renderer, scene, camera };
+  if (this === scene) renderedFrames++;
+};
 async function main() {
   results.push('実ブラウザで検証中（通常のセーブには触れません）'); update();
   await check('IndexedDB保存→再読込（掘削差分・耐久・所持品）', async () => {
@@ -116,13 +126,81 @@ async function main() {
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
     await until(() => !document.querySelector('[role="dialog"]'));
   });
+  await check('画質・影・揺れを即時反映し、設定を保存', async () => {
+    await click('一時停止'); await click('高画質');
+    await until(() => rendered?.renderer.getPixelRatio() === Math.min(devicePixelRatio, 1.75));
+    const light = rendered!.scene.children.find(child => child instanceof THREE.DirectionalLight) as THREE.DirectionalLight;
+    assert(light.shadow.mapSize.x === 2048 && rendered!.renderer.shadowMap.enabled, '高画質の影設定が反映されません');
+    await click('軽量');
+    await until(() => rendered?.renderer.getPixelRatio() === Math.min(devicePixelRatio, 0.85) && !rendered.renderer.shadowMap.enabled);
+    assert(!light.castShadow && light.shadow.mapSize.x === 512, '軽量の影設定が反映されません');
+    const shadows = document.querySelector<HTMLInputElement>('[aria-label="影を表示"]')!;
+    shadows.click(); await until(() => rendered?.renderer.shadowMap.enabled);
+    shadows.click(); await until(() => !rendered?.renderer.shadowMap.enabled);
+    document.querySelector<HTMLInputElement>('[aria-label="画面の揺れ"]')!.click();
+    await click('今すぐ保存');
+    await until(() => document.body.textContent?.includes('保存しました'));
+    const data = (await storage.load())!;
+    assert(data.settings.graphicsQuality === 'low' && data.settings.shadowsEnabled === false && data.settings.cameraShake === false, '画質設定が保存されません');
+    await click('閉じてゲームへ戻る');
+  });
   await check('再マウントでも耐久値と移動後のアイテム総数を保持', async () => {
     const read = (await storage.load())!;
     assert(read.inventory[5].durability === 7, '耐久値が失われました');
     assert(read.inventory.reduce((n, s) => n + (s.itemId === 'wood' ? s.count : 0), 0) === 16, '原木の総数が変わりました');
     root!.unmount(); root = createRoot(document.getElementById('root')!); root.render(<App storage={storage} />);
     await until(() => { const start = button('ゲームを開始 / 再開'); return start && !start.disabled; });
+    await until(() => rendered?.renderer.getPixelRatio() === Math.min(devicePixelRatio, 0.85) && !rendered.renderer.shadowMap.enabled);
   });
-  results.push('完了: 9 / 9 PASS'); document.documentElement.dataset.testStatus = 'passed'; update();
+  await check('配置プレビュー・実配置・自己重複の拒否で個数を保持', async () => {
+    root!.unmount();
+    let current = fixture();
+    current.world.edits = [];
+    for (let x = 4; x <= 12; x++) for (let z = 1; z <= 12; z++) current.world.edits.push({ x, y: 40, z, type: BLOCKS.STONE });
+    current.player.position = [8.5, 42.62, 8.5]; current.player.rotation = [-0.45, 0, 0];
+    root = createRoot(document.getElementById('root')!);
+    root.render(<App storage={{ load: async () => structuredClone(current), save: async data => { current = structuredClone(data); } }} />);
+    await until(() => { const start = button('ゲームを開始 / 再開'); return start && !start.disabled; });
+    if (button('タッチ操作: OFF')) await click('タッチ操作: OFF');
+    await click('ゲームを開始 / 再開');
+    await until(() => document.querySelector('[aria-label="配置ガイド"]')?.textContent?.includes('原木を配置'));
+    const ghost = rendered!.scene.getObjectByName('placement-preview') as THREE.Mesh;
+    assert(ghost.visible && (ghost.material as THREE.MeshBasicMaterial).color.getHex() === 0x69f0a4, '配置可能な緑のプレビューがありません');
+    await click('置く / 使う');
+    await until(() => named('装備1 原木 ×15'));
+    const look = document.querySelector<HTMLElement>('[aria-label="視点をドラッグ"]')!;
+    // Synthetic drag changes the actual camera through TouchControls. OS capture is outside this test.
+    look.setPointerCapture = () => {};
+    look.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 400, pointerType: 'touch', clientX: 200, clientY: 100 }));
+    look.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, pointerId: 400, pointerType: 'touch', clientX: 200, clientY: 350 }));
+    look.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 400, pointerType: 'touch', clientX: 200, clientY: 350 }));
+    await until(() => document.querySelector('[aria-label="配置ガイド"]')?.textContent?.includes('自分と重なっています'));
+    assert(ghost.visible && (ghost.material as THREE.MeshBasicMaterial).color.getHex() === 0xff6666, '配置不可の赤いプレビューがありません');
+    await click('置く / 使う');
+    assert(named('装備1 原木 ×15'), '配置拒否でアイテムを消費しました');
+    await click('一時停止');
+    assert(!ghost.visible, 'メニューにプレビューが残りました');
+    await click('今すぐ保存');
+    await until(() => current.world.edits.some(edit => edit.type === BLOCKS.WOOD));
+    assert(current.inventory[0].count === 15 && current.world.edits.filter(edit => edit.type === BLOCKS.WOOD).length === 1, '設置と消費が一致しません');
+  });
+  await check('実際の移動で雲が追従せず、メニュー中は描画を間引く', async () => {
+    const before = renderedFrames;
+    await new Promise(resolve => setTimeout(resolve, 550));
+    assert(renderedFrames - before <= 10, 'メニュー中に15fpsを超えて描画しました');
+    await click('閉じてゲームへ戻る');
+    const cloud = rendered!.scene.children.find(child => child instanceof THREE.InstancedMesh && child.count === 196) as THREE.InstancedMesh;
+    assert(cloud, '環境の雲が見つかりません');
+    const matrix = new THREE.Matrix4(); cloud.getMatrixAt(7 * 14 + 7, matrix);
+    const cloudZ = matrix.elements[14] + cloud.position.z, startZ = rendered!.camera.position.z;
+    document.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', key: 'w', bubbles: true }));
+    try { await until(() => rendered!.camera.position.z < startZ - 1, 'Wキーで移動しません'); }
+    finally { document.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW', key: 'w', bubbles: true })); }
+    cloud.getMatrixAt(7 * 14 + 7, matrix);
+    assert(matrix.elements[14] + cloud.position.z === cloudZ, '歩行に雲の位置が追従しました');
+    await click('一時停止');
+  });
+  THREE.Object3D.prototype.onBeforeRender = beforeRender;
+  results.push('完了: 12 / 12 PASS'); document.documentElement.dataset.testStatus = 'passed'; update();
 }
 void main().catch(error => { results.push(`FAIL ${error instanceof Error ? error.message : String(error)}`); document.documentElement.dataset.testStatus = 'failed'; update(); console.error(error); });

@@ -22,6 +22,8 @@ import { FixedStepper, GameSession, findSafeSpawn, resetPlayerView, normalizeYaw
 import { disposeObjects } from './resources';
 import { bodyBox, mobHeight } from './combat';
 import { GameDialog } from './Dialog';
+import { applyGraphics, type GraphicsQuality } from './graphics';
+import { evaluatePlacement } from './placement';
 import { viewFog } from './environmentSettings';
 import { movePlayer, WALK_SPEED, SPRINT_SPEED, SNEAK_SPEED } from './playerMotion';
 import { SurvivalHud } from './SurvivalHud';
@@ -74,6 +76,9 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
   const primaryHeldRef = useRef(false);
   const [miningView, setMiningView] = useState({ percent: 0, label: '' });
   const [itemMessage, setItemMessage] = useState('');
+  const placementHintRef = useRef('');
+  const [placementHint, setPlacementHint] = useState('');
+  const [frameStats, setFrameStats] = useState({ fps: 0, calls: 0, triangles: 0 });
   const [activeChestKey, setActiveChestKey] = useState<string | null>(null);
   const [activeFurnaceKey, setActiveFurnaceKey] = useState<string | null>(null);
   const { items, itemsRef, updateItems, publishItems } = useItems();
@@ -105,6 +110,9 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
   const [fov, setFov] = useState(75);
   const [renderDist, setRenderDist] = useState(2);
   const [peaceful, setPeaceful] = useState(false);
+  const [graphicsQuality, setGraphicsQuality] = useState<GraphicsQuality>('balanced');
+  const [shadowsEnabled, setShadowsEnabled] = useState(true);
+  const [cameraShake, setCameraShake] = useState(true);
 
   // Toast / Achievement notification
   const [toastMessage, setToastMessage] = useState<{ title: string; desc: string; icon: string } | null>(null);
@@ -127,7 +135,7 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
   const saveUi = {
     activeSlot,
     achievements: achievements.filter(a => a.unlocked).map(a => a.id),
-    settings: { gameMode, soundEnabled, musicEnabled, fov, renderDist, peaceful },
+    settings: { gameMode, soundEnabled, musicEnabled, fov, renderDist, peaceful, graphicsQuality, shadowsEnabled, cameraShake },
     health, hunger, oxygen,
   };
   const saveUiRef = useRef(saveUi);
@@ -413,6 +421,9 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
           setFov(restored.settings.fov);
           setRenderDist(restored.settings.renderDist);
           setPeaceful(restored.settings.peaceful);
+          setGraphicsQuality(restored.settings.graphicsQuality ?? 'balanced');
+          setShadowsEnabled(restored.settings.shadowsEnabled ?? true);
+          setCameraShake(restored.settings.cameraShake ?? true);
           for (const drop of restored.drops) {
             mobManager.spawnDroppedItem(drop.itemId, drop.count, new THREE.Vector3(...drop.position), drop.durability);
             const entity = mobManager.droppedItems[mobManager.droppedItems.length - 1];
@@ -468,14 +479,15 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
       scope.own(() => window.removeEventListener('resize', handleResize));
 
       // Main Game Animation Loop
-      let uiTimer = 0;
+      let uiTimer = 0, renderTimer = 0, statsTime = 0, statsFrames = 0;
       const stepper = new FixedStepper();
 
       const animate = () => {
         if (disposed || failed) return;
         try {
           animId = requestAnimationFrame(animate);
-          const delta = Math.min(clock.getDelta(), 0.08);
+          const frameDelta = clock.getDelta();
+          const delta = Math.min(frameDelta, 0.08);
 
           const ready = persistenceRef.current.initialized && !document.hidden;
           const active = ready && playingRef.current && !openModalRef.current;
@@ -495,6 +507,11 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
             updateGame(dt, refs);
             if (playingRef.current) processPrimary(dt, refs);
           });
+          if (document.hidden) { statsTime = 0; statsFrames = 0; return; }
+          // Static menus need fewer frames; game simulation keeps its fixed clock.
+          renderTimer += delta;
+          if (!active && renderTimer < 1 / 15) return;
+          renderTimer = 0;
           uiTimer += delta;
           if (uiTimer >= 0.1) {
             uiTimer = 0;
@@ -508,11 +525,20 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
             setTimeString(`${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`);
             const progress = refs.breakProgress;
             const percent = progress.pos ? Math.min(100, progress.timer / progress.maxDuration * 100) : 0;
+            setPlacementHint(placementHintRef.current);
             const label = miningHintRef.current;
             setMiningView(previous => previous.percent === percent && previous.label === label ? previous : { percent, label });
           }
 
+          world.placementMesh.visible = active && world.placementMesh.visible;
           renderer.render(scene, camera);
+          if (active) {
+            statsTime += frameDelta; statsFrames++;
+            if (statsTime >= 0.5) {
+              setFrameStats({ fps: Math.round(statsFrames / statsTime), calls: renderer.info.render.calls, triangles: renderer.info.render.triangles });
+              statsTime = 0; statsFrames = 0;
+            }
+          } else { statsTime = 0; statsFrames = 0; }
         } catch (error) { fail(error); }
       };
       animate();
@@ -535,6 +561,16 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
       } catch (error) { initializationFailureRef.current?.(error); }
     }
   }, [fov, renderDist, isReady]);
+
+  useEffect(() => {
+    const refs = threeRefs.current;
+    if (!refs || !isReady) return;
+    try {
+      applyGraphics(refs.renderer, refs.environment.dirLight, refs.environment.particleSystem,
+        graphicsQuality, shadowsEnabled, window.devicePixelRatio);
+      if (!cameraShake) refs.camera.rotation.z = 0;
+    } catch (error) { initializationFailureRef.current?.(error); }
+  }, [graphicsQuality, shadowsEnabled, cameraShake, isReady]);
 
   // Sound settings sync
   useEffect(() => {
@@ -562,6 +598,9 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
     refs.breakProgress.pos = null;
     refs.breakProgress.timer = 0;
     refs.world.setCrackStage(null, -1);
+    refs.world.setPlacementPreview(null);
+    placementHintRef.current = '';
+    setPlacementHint('');
   }, []);
   const beginPlay = useCallback(() => {
     const refs = threeRefs.current;
@@ -620,7 +659,7 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
     if (session.phase === 'dead') {
       resetControls(); setPlaying(false); setModal(null); setIsDead(true); refs.controls.unlock();
       setHealthView(0);
-    } else refs.camera.rotation.z += (Math.random() - 0.5) * 0.12;
+    } else if (saveUiRef.current.settings.cameraShake) refs.camera.rotation.z += (Math.random() - 0.5) * 0.12;
   }, []);
   const respawnPlayer = () => {
     const refs = threeRefs.current;
@@ -804,6 +843,16 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
       world.setTargetHighlight(null);
       world.setCrackStage(null, -1);
       setTargetBlockName(null);
+    }
+    const slot = itemsRef.current.inventory[activeSlotRef.current];
+    const item = slot?.itemId ? ITEMS[slot.itemId] : null;
+    if (hit && item?.isBlock && item.blockType && slot.count > 0 && !BLOCK_DEFS[hit.blockId]?.isInteractive) {
+      const placement = evaluatePlacement(world, hit.blockPos.clone().add(hit.normal), camera.position, refs.player);
+      world.setPlacementPreview(placement, item.blockType as BlockId);
+      placementHintRef.current = placement.allowed ? `${item.name}を配置` : `配置不可：${placement.reason}`;
+    } else {
+      world.setPlacementPreview(null);
+      placementHintRef.current = '';
     }
   };
 
@@ -1032,13 +1081,12 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
       mobManager.shootArrow(camera.position.clone().addScaledVector(direction, 0.5), direction, true, 26); return;
     }
     if (!hit || !item?.isBlock || !item.blockType || slot.count <= 0) return;
-    const place = hit.blockPos.clone().add(hit.normal);
-    if (world.getBlock(place.x, place.y, place.z) !== null) { setItemMessage('そこには置けません。アイテムは消費していません。'); return; }
-    const min = camera.position.clone().sub(new THREE.Vector3(refs.player.radius, refs.player.height, refs.player.radius));
-    const max = camera.position.clone().add(new THREE.Vector3(refs.player.radius, 0.1, refs.player.radius));
-    if (min.x < place.x + 1 && max.x > place.x && min.y < place.y + 1 && max.y > place.y && min.z < place.z + 1 && max.z > place.z) return;
+    const placement = evaluatePlacement(world, hit.blockPos.clone().add(hit.normal), camera.position, refs.player);
+    if (!placement.allowed) { setItemMessage(`配置不可：${placement.reason}。アイテムは消費していません。`); return; }
+    const place = placement.position;
     world.addBlock(place.x, place.y, place.z, item.blockType as BlockId);
     if (!creative) consume(index);
+    setItemMessage('');
     sound.playPlaceBlock();
   }, [unlockAchievement]);
 
@@ -1181,6 +1229,10 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
         </div>
       </div>
 
+      {isPlaying && !openModal && placementHint && <div className="absolute top-[calc(50%+24px)] left-1/2 -translate-x-1/2 z-20 pointer-events-none max-w-[70vw] px-2 py-1 bg-black/65 text-center text-[11px] text-white" aria-label="配置ガイド">
+        {placementHint}
+      </div>}
+
       {/* Top Left: Environment Diagnostics & Info */}
       <div className={`${showDebug ? 'block' : 'hidden'} absolute top-4 left-4 z-20 pointer-events-none bg-black/60 backdrop-blur-md px-3.5 py-2.5 rounded-lg border border-white/10 font-mono text-xs shadow-lg space-y-1`}>
         <div className="flex items-center gap-2 text-emerald-400 font-bold tracking-wide">
@@ -1188,6 +1240,7 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
           <span>VOXELVERSE · DEBUG [F3]</span>
         </div>
         <div className="text-gray-300 text-[11px] space-y-0.5">
+          <p>{frameStats.fps} FPS · 描画 {frameStats.calls} 回 · {Math.round(frameStats.triangles / 1000)}k 三角形</p>
           <p>
             COORD: <span className="text-white font-semibold">X: {coords.x} Y: {coords.y} Z: {coords.z}</span>
           </p>
@@ -1381,6 +1434,23 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
                   className="w-full accent-emerald-500"
                 />
               </div>
+
+              <fieldset className="space-y-2">
+                <legend className="text-sm font-semibold mb-2">描画品質</legend>
+                <div className="flex gap-1">
+                  {([['low', '軽量'], ['balanced', '標準'], ['high', '高画質']] as const).map(([value, label]) => <button
+                    key={value} type="button" aria-pressed={graphicsQuality === value}
+                    onClick={() => { setGraphicsQuality(value); setShadowsEnabled(value !== 'low'); }}
+                    className={`flex-1 min-h-11 border text-xs font-bold ${graphicsQuality === value ? 'border-emerald-400 bg-emerald-600 text-white' : 'border-white/20 bg-neutral-900'}`}>{label}</button>)}
+                </div>
+                <p className="text-xs text-neutral-400 leading-relaxed">{graphicsQuality === 'low' ? '描画解像度を抑え、影と空気中の粒子を省いて動作を軽くします。' : graphicsQuality === 'high' ? '描画と影の解像度を上げ、輪郭をくっきり表示します。' : '見た目と動作の軽さを両立する標準設定です。'} 影は個別に切り替えられます。</p>
+              </fieldset>
+              <label className="flex justify-between items-center min-h-11 text-sm font-semibold">影を表示
+                <input aria-label="影を表示" type="checkbox" checked={shadowsEnabled} onChange={e => setShadowsEnabled(e.target.checked)} className="w-4 h-4 accent-emerald-500" />
+              </label>
+              <label className="flex justify-between items-center min-h-11 text-sm font-semibold">被ダメージ時の画面の揺れ
+                <input aria-label="画面の揺れ" type="checkbox" checked={cameraShake} onChange={e => setCameraShake(e.target.checked)} className="w-4 h-4 accent-emerald-500" />
+              </label>
 
               {/* Sound & Music Toggles */}
               <div className="flex justify-between items-center pt-2">
