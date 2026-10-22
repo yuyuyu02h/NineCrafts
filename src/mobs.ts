@@ -513,11 +513,15 @@ export class MobManager {
     // 3. Update Dropped Items (rotation, float, player attraction)
     for (let i = this.droppedItems.length - 1; i >= 0; i--) {
       const drop = this.droppedItems[i];
+      // Unknown terrain is not air. Freeze the whole entity, including its expiry clock.
+      const loaded = this.world.isChunkLoaded?.(drop.position.x, drop.position.z) ?? true;
+      drop.mesh.visible = loaded;
+      if (!loaded) continue;
       drop.mesh.rotation.y += 2.0 * delta;
       drop.life -= delta;
 
       // Gravity
-      drop.velocity.y -= 18 * delta;
+      drop.velocity.y = Math.max(-30, drop.velocity.y - 18 * delta);
       drop.position.y += drop.velocity.y * delta;
       if (this.world.getBlock(drop.position.x, drop.position.y, drop.position.z)) {
         drop.position.y = Math.floor(drop.position.y) + 1;

@@ -13,10 +13,11 @@
   <button onclick="size(390,640)">縦 390×640</button>
   <button onclick="size(844,390)">横 844×390</button>
   <button onclick="size(640,360)">横 640×360</button>
-  <span>ゲーム開始前に「タッチ操作」をONにしてください。開発用の手動検証ページです。</span>
-</nav>
-<iframe title="検証用ゲーム" src="/"></iframe>
+  <button onclick="size(320,568)">縦 320×568</button><span>保存はメモリ内のみ。通常のワールドには触れません。</span>
+<button onclick="screen('inventory')">持ち物</button><button onclick="screen('settings')">設定</button><button onclick="screen('help')">ヘルプ</button><button onclick="screen('play')">ゲーム</button></nav>
+<iframe title="検証用ゲーム" src="./ui-preview.html?screen=inventory"></iframe>
 <script>
+  function screen(name) { document.querySelector('iframe').src = './ui-preview.html?screen=' + name; }
   function size(width, height) {
     const frame = document.querySelector('iframe');
     frame.style.width = width + 'px'; frame.style.height = height + 'px';

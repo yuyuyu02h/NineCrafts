@@ -25,6 +25,25 @@ export class GameSession {
   hurtUntil = 0;
   attackUntil = 0;
   deathReason = '';
+  private exhaustion = 0;
+  private regenerationTimer = 0;
+  private starvationTimer = 0;
+  exhaust(amount: number) {
+    this.exhaustion += Math.max(0, amount);
+    while (this.exhaustion >= 4) { this.exhaustion -= 4; this.hunger = Math.max(0, this.hunger - 1); }
+  }
+  survival(delta: number, speed: number, sprinting: boolean, damage: (amount: number, reason: string) => void) {
+    if (this.phase !== 'playing') return;
+    this.exhaust(delta * (0.005 + speed * (sprinting ? 0.1 : 0.01)));
+    if (this.hunger >= 18 && this.health < 20) {
+      this.regenerationTimer += delta;
+      if (this.regenerationTimer >= 4) { this.regenerationTimer -= 4; this.health = Math.min(20, this.health + 1); this.exhaust(3); }
+    } else this.regenerationTimer = 0;
+    if (this.hunger <= 0 && this.health > 1) {
+      this.starvationTimer += delta;
+      if (this.starvationTimer >= 4) { this.starvationTimer -= 4; damage(1, '空腹'); }
+    } else this.starvationTimer = 0;
+  }
   play() { if (this.phase !== 'dead') this.phase = 'playing'; }
   pause() { if (this.phase !== 'dead') this.phase = 'paused'; }
   advance(delta: number) { if (this.phase === 'playing') this.elapsed += delta; }
@@ -43,6 +62,7 @@ export class GameSession {
     this.health = 20; this.hunger = 20; this.oxygen = 10;
     this.phase = 'paused'; this.hurtUntil = this.elapsed + 2;
     this.attackUntil = this.elapsed; this.deathReason = '';
+    this.exhaustion = 0; this.regenerationTimer = 0; this.starvationTimer = 0;
   }
 }
 

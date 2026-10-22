@@ -101,6 +101,10 @@ export class VoxelWorld {
     return `${cx},${cz}`;
   }
 
+  public isChunkLoaded(x: number, z: number): boolean {
+    return this.generatedChunks.has(this.getChunkKey(Math.floor(x / CHUNK_SIZE), Math.floor(z / CHUNK_SIZE)));
+  }
+
   public waterMaterial: THREE.MeshStandardMaterial | THREE.MeshPhysicalMaterial | null = null;
 
   public markChunkDirty(cx: number, cz: number) {

@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { initializeClouds } from './environmentSettings';
 
 export class ShaderEnvironment {
   public scene: THREE.Scene;
@@ -17,9 +18,7 @@ export class ShaderEnvironment {
 
   // Volumetric Clouds Layer
   public cloudMesh: THREE.InstancedMesh;
-  private cloudDummy = new THREE.Object3D();
   private cloudCount = 196;
-  private cloudBasePositions: { x: number; z: number; scaleX: number; scaleZ: number }[] = [];
   private cloudOffset = 0;
 
   // Atmospheric Particles (Pollen / Dust motes / Night Fireflies)
@@ -131,25 +130,7 @@ export class ShaderEnvironment {
     this.cloudMesh.receiveShadow = false;
     this.cloudMesh.castShadow = true; // Clouds cast real shadows on the terrain!
 
-    // Scatter cloud clusters in a wide area
-    const clusterCenters = [
-      { x: -50, z: -50 }, { x: 20, z: -40 }, { x: -30, z: 40 },
-      { x: 60, z: 30 }, { x: 0, z: 0 }, { x: -80, z: 20 }, { x: 50, z: -70 }
-    ];
-
-    let idx = 0;
-    clusterCenters.forEach((center) => {
-      const blobs = Math.floor(this.cloudCount / clusterCenters.length);
-      for (let b = 0; b < blobs && idx < this.cloudCount; b++) {
-        const cx = center.x + (Math.random() - 0.5) * 45;
-        const cz = center.z + (Math.random() - 0.5) * 45;
-        const sX = 8 + Math.random() * 12;
-        const sZ = 8 + Math.random() * 12;
-        this.cloudBasePositions.push({ x: cx, z: cz, scaleX: sX, scaleZ: sZ });
-        idx++;
-      }
-    });
-
+    initializeClouds(this.cloudMesh);
     this.scene.add(this.cloudMesh);
 
     // 7. Atmospheric Environmental Particles (Sun dust / Fireflies)

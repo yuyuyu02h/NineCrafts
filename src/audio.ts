@@ -1,9 +1,17 @@
 // Procedural Web Audio API sound synthesizer for VoxelVerse
 
-class SoundEngine {
+export class SoundEngine {
   private ctx: AudioContext | null = null;
   public soundEnabled: boolean = true;
-  public musicEnabled: boolean = true;
+  private _musicEnabled = true;
+  private musicVoices = new Set<OscillatorNode>();
+  public get musicEnabled() { return this._musicEnabled; }
+  public set musicEnabled(enabled: boolean) {
+    if (enabled === this._musicEnabled) return;
+    this._musicEnabled = enabled;
+    this.stopMusic();
+    if (enabled && this.ctx) this.scheduleMusic();
+  }
   public volume: number = 0.5;
   private nextMusicTime: number = 0;
   private musicTimeout: number | null = null;
@@ -23,6 +31,13 @@ class SoundEngine {
     if (this.musicEnabled && !this.musicTimeout) {
       this.scheduleMusic();
     }
+  }
+
+  public stopMusic() {
+    if (this.musicTimeout !== null) window.clearTimeout(this.musicTimeout);
+    this.musicTimeout = null;
+    for (const voice of this.musicVoices) { try { voice.stop(); } catch {} }
+    this.musicVoices.clear();
   }
 
   private createGain(vol: number): GainNode | null {
@@ -484,6 +499,7 @@ class SoundEngine {
   private scheduleMusic() {
     if (!this.musicEnabled) return;
     const playChord = () => {
+      this.musicTimeout = null;
       if (!this.musicEnabled || !this.ctx) return;
       try {
         const chords = [
@@ -500,6 +516,9 @@ class SoundEngine {
           const osc = this.ctx.createOscillator();
           const gain = this.ctx.createGain();
           const filter = this.ctx.createBiquadFilter();
+
+          this.musicVoices.add(osc);
+          osc.onended = () => { this.musicVoices.delete(osc); osc.disconnect(); filter.disconnect(); gain.disconnect(); };
 
           filter.type = 'lowpass';
           filter.frequency.value = 500;

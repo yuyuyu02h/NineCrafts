@@ -44,15 +44,21 @@ export function insertStack(inventory: InventorySlot[], incoming: InventorySlot)
   return { inventory: remaining === incoming.count ? inventory : next, accepted: incoming.count - remaining, remaining };
 }
 
-export function clickInventory(state: ItemState, index: number): ItemState {
+export function clickInventory(state: ItemState, index: number, secondary = false): ItemState {
   const slot = state.inventory[index];
   if (!slot) return state;
   const cursor = state.cursorItem;
   const inventory = state.inventory.slice();
   if (!cursor?.itemId) {
     if (!slot.itemId) return state;
-    inventory[index] = emptySlot();
-    return { ...state, inventory, cursorItem: slot };
+    const count = secondary ? Math.ceil(slot.count / 2) : slot.count;
+    inventory[index] = consumeSlot(slot, count);
+    return { ...state, inventory, cursorItem: { ...slot, count } };
+  }
+  if (secondary && (!slot.itemId || sameStack(slot, cursor))) {
+    if (slot.count >= ITEMS[cursor.itemId].maxStack) return state;
+    inventory[index] = { ...cursor, count: slot.count + 1 };
+    return { ...state, inventory, cursorItem: cursor.count > 1 ? consumeSlot(cursor) : null };
   }
   if (slot.itemId && sameStack(slot, cursor)) {
     const add = Math.min(cursor.count, ITEMS[cursor.itemId].maxStack - slot.count);
@@ -134,12 +140,19 @@ export function ensureFurnace(state: ItemState, key: string): ItemState {
   if (Object.hasOwn(state.furnaces, key)) return state;
   return { ...state, furnaces: { ...state.furnaces, [key]: state.legacyFurnace ?? emptyFurnace() }, legacyFurnace: null };
 }
-export function clickFurnaceSlot(state: ItemState, key: string, kind: 'input' | 'fuel'): ItemState {
+export function clickFurnaceSlot(state: ItemState, key: string, kind: 'input' | 'fuel', secondary = false): ItemState {
   const furnace = state.furnaces[key];
   if (!furnace) return state;
   const held = state.cursorItem;
   const slot = furnace[kind];
   if (held?.itemId && !(kind === 'input' ? smeltingRecipe(held.itemId) : FUEL_SECONDS[held.itemId])) return state;
+  if (secondary) {
+    const moved = clickInventory({ ...state, inventory: [slot] }, 0, true);
+    const target = moved.inventory[0];
+    return { ...state, cursorItem: moved.cursorItem, furnaces: { ...state.furnaces, [key]: {
+      ...furnace, [kind]: target, progress: kind === 'input' && target.itemId !== slot.itemId ? 0 : furnace.progress,
+    } } };
+  }
   if (!held?.itemId && !slot.itemId) return state;
   let cursorItem: InventorySlot | null;
   let target: InventorySlot;
@@ -174,12 +187,39 @@ export function ensureChest(state: ItemState, key: string): ItemState {
   if (Object.hasOwn(state.chests, key)) return state;
   return { ...state, chests: { ...state.chests, [key]: state.legacyChest ?? Array.from({ length: 27 }, emptySlot) }, legacyChest: null };
 }
-export function clickChest(state: ItemState, key: string, index: number): ItemState {
+export function clickChest(state: ItemState, key: string, index: number, secondary = false): ItemState {
   const slots = state.chests[key];
   if (!slots || !slots[index]) return state;
   const container = { ...state, inventory: slots };
-  const moved = clickInventory(container, index);
+  const moved = clickInventory(container, index, secondary);
   return moved === container ? state : { ...state, cursorItem: moved.cursorItem, chests: { ...state.chests, [key]: moved.inventory } };
+}
+
+/** Shift-click transfers only the accepted amount, never dropping leftovers. */
+export function quickMoveInventory(state: ItemState, index: number, chestKey?: string | null, furnaceKey?: string | null): ItemState {
+  const source = state.inventory[index];
+  if (!source?.itemId) return state;
+  const finish = (accepted: number) => {
+    const inventory = state.inventory.slice(); inventory[index] = consumeSlot(source, accepted); return inventory;
+  };
+  if (chestKey && state.chests[chestKey]) {
+    const result = insertStack(state.chests[chestKey], source);
+    return result.accepted ? { ...state, inventory: finish(result.accepted), chests: { ...state.chests, [chestKey]: result.inventory } } : state;
+  }
+  if (furnaceKey && state.furnaces[furnaceKey]) {
+    const furnace = state.furnaces[furnaceKey];
+    const kind = smeltingRecipe(source.itemId) ? 'input' : FUEL_SECONDS[source.itemId] ? 'fuel' : null;
+    if (!kind) return state;
+    const result = insertStack([furnace[kind]], source);
+    return result.accepted ? { ...state, inventory: finish(result.accepted), furnaces: { ...state.furnaces, [furnaceKey]: {
+      ...furnace, [kind]: result.inventory[0], progress: kind === 'input' && furnace.input.itemId !== source.itemId ? 0 : furnace.progress,
+    } } } : state;
+  }
+  const start = index < 9 ? 9 : 0, end = index < 9 ? 36 : 9;
+  const result = insertStack(state.inventory.slice(start, end), source);
+  if (!result.accepted) return state;
+  const inventory = finish(result.accepted); inventory.splice(start, end - start, ...result.inventory);
+  return { ...state, inventory };
 }
 export function collectChestSlot(state: ItemState, key: string, index: number): ItemState {
   const slot = state.chests[key]?.[index];

@@ -9,10 +9,10 @@ import { sound } from './audio';
 import { GameMode, Achievement } from './types';
 import { CRAFTING_RECIPES, matchRecipe } from './recipes';
 import { ShaderEnvironment } from './environment';
-import { loadGame, saveGame } from './storage';
+import { gameStorage, type GameStorage } from './storage';
 import { SAVE_VERSION, type GameSave } from './save';
 import { useItems } from './useItems';
-import { clickInventory, clickCraftCell, craftGrid, quickCraft, insertStack, stack, returnCursor, ensureFurnace, clickFurnaceSlot, collectFurnace, wearTool, ensureChest, clickChest, collectChestSlot } from './items';
+import { clickInventory, clickCraftCell, craftGrid, quickCraft, insertStack, stack, returnCursor, ensureFurnace, clickFurnaceSlot, collectFurnace, wearTool, ensureChest, clickChest, collectChestSlot, quickMoveInventory } from './items';
 import { consumeSlot, stepFurnace } from './furnace';
 import { miningRule, toolSignature } from './mining';
 import { ItemMenu } from './ItemMenu';
@@ -21,20 +21,17 @@ import { bindGameMouse } from './mouseInput';
 import { FixedStepper, GameSession, findSafeSpawn, resetPlayerView, normalizeYaw } from './simulation';
 import { disposeObjects } from './resources';
 import { bodyBox, mobHeight } from './combat';
+import { GameDialog } from './Dialog';
+import { viewFog } from './environmentSettings';
+import { movePlayer, WALK_SPEED, SPRINT_SPEED, SNEAK_SPEED } from './playerMotion';
+import { SurvivalHud } from './SurvivalHud';
+import { CleanupScope } from './lifecycle';
 import {
   Volume2,
   VolumeX,
   Settings,
   HelpCircle,
-  Save,
-  Download,
-  Upload,
-  RotateCcw,
   Sparkles,
-  Flame,
-  X,
-  Compass,
-  Zap,
 } from 'lucide-react';
 
 const INITIAL_ACHIEVEMENTS: Achievement[] = [
@@ -48,8 +45,12 @@ const INITIAL_ACHIEVEMENTS: Achievement[] = [
   { id: 'bed', title: '良い夢を', description: 'ベッドで眠り朝を迎える', icon: '🛏️', unlocked: false },
 ];
 
-export default function App() {
+export default function App({ storage = gameStorage }: { storage?: GameStorage }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [initialization, setInitialization] = useState(0);
+  const [fatalError, setFatalError] = useState<string | null>(null);
+  const initializationFailureRef = useRef<((error: unknown) => void) | null>(null);
+  const recoverySnapshotRef = useRef<GameSave | null>(null);
   const [isReady, setIsReady] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [storageError, setStorageError] = useState(false);
@@ -76,7 +77,7 @@ export default function App() {
   const [activeChestKey, setActiveChestKey] = useState<string | null>(null);
   const [activeFurnaceKey, setActiveFurnaceKey] = useState<string | null>(null);
   const { items, itemsRef, updateItems, publishItems } = useItems();
-  const { inventory, cursorItem, craft2x2, craft3x3 } = items;
+  const { inventory, cursorItem } = items;
   const [gameMode, setGameMode] = useState<GameMode>('survival');
   const [activeSlot, setActiveSlot] = useState(0); // 0 - 8
   const [health, setHealthView] = useState(20);
@@ -87,7 +88,6 @@ export default function App() {
   const setOxygen = (value: React.SetStateAction<number>) => { const state = sessionRef.current; state.oxygen = typeof value === 'function' ? value(state.oxygen) : value; }; // 0 - 10 (10 bubbles underwater)
   const [isUnderwater, setIsUnderwater] = useState(false);
   const [timeString, setTimeString] = useState('12:00');
-  const [lumenPercent, setLumenPercent] = useState(100);
   const [coords, setCoords] = useState({ x: 0, y: 10, z: 0, biome: 'plains' });
   const [targetBlockName, setTargetBlockName] = useState<string | null>(null);
 
@@ -110,6 +110,8 @@ export default function App() {
   const [toastMessage, setToastMessage] = useState<{ title: string; desc: string; icon: string } | null>(null);
   const [achievements, setAchievements] = useState<Achievement[]>(INITIAL_ACHIEVEMENTS);
 
+  const stepSoundRef = useRef(0);
+  const [showDebug, setShowDebug] = useState(false);
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
 
   // Synchronized refs for event handlers (avoids stale closures during PointerLock)
@@ -142,13 +144,14 @@ export default function App() {
     world: VoxelWorld;
     mobManager: MobManager;
     clock: THREE.Clock;
-    moveState: { forward: boolean; backward: boolean; left: boolean; right: boolean; jump: boolean; sprint: boolean };
+    moveState: { forward: boolean; backward: boolean; left: boolean; right: boolean; jump: boolean; sprint: boolean; sneak: boolean };
     player: {
       velocity: THREE.Vector3;
       onGround: boolean;
       height: number;
       radius: number;
       flying: boolean;
+      fallDistance: number;
     };
     timeOfDay: number;
     breakProgress: {
@@ -161,37 +164,44 @@ export default function App() {
     isNight: boolean;
   } | null>(null);
 
+  const captureCurrentGame = useCallback((): GameSave | null => {
+    const refs = threeRefs.current;
+    if (!refs) return null;
+    const persistence = persistenceRef.current;
+    const ui = { ...saveUiRef.current, health: sessionRef.current.health, hunger: sessionRef.current.hunger, oxygen: sessionRef.current.oxygen };
+    const { health, hunger, oxygen, ...rest } = ui;
+    return structuredClone({
+      ...rest,
+      ...itemsRef.current,
+      version: SAVE_VERSION,
+      savedAt: Math.max(Date.now(), (persistence.lastSavedAt ?? 0) + 1),
+      world: refs.world.exportSaveData(),
+      primedTnt: refs.world.primedTnt,
+      player: {
+        position: refs.camera.position.toArray() as [number, number, number],
+        rotation: [refs.camera.rotation.x, normalizeYaw(refs.camera.rotation.y), refs.camera.rotation.z],
+        health, hunger, oxygen, flying: refs.player.flying,
+      },
+      timeOfDay: ((refs.timeOfDay % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2),
+      drops: refs.mobManager.droppedItems.filter(d => d.life > 0).map(d => ({
+        itemId: d.itemId, count: d.count, durability: d.durability,
+        position: d.position.toArray() as [number, number, number],
+        velocity: d.velocity.toArray() as [number, number, number], life: d.life,
+      })),
+    });
+  }, []);
+
   const saveCurrentGame = useCallback(async () => {
     const persistence = persistenceRef.current;
     const refs = threeRefs.current;
     if (!refs || !persistence.initialized || !persistence.canWrite || persistence.busy) return;
-    const ui = { ...saveUiRef.current, health: sessionRef.current.health, hunger: sessionRef.current.hunger, oxygen: sessionRef.current.oxygen };
-    // Death is followed by the existing respawn flow. Don't persist an intermediate HP=0 state.
     if (sessionRef.current.health <= 0) return;
     persistence.busy = true;
     setIsSaving(true);
     try {
-      const { health, hunger, oxygen, ...rest } = ui;
-      const snapshot: GameSave = structuredClone({
-        ...rest,
-        ...itemsRef.current,
-        version: SAVE_VERSION,
-        savedAt: Math.max(Date.now(), (persistence.lastSavedAt ?? 0) + 1),
-        world: refs.world.exportSaveData(),
-        primedTnt: refs.world.primedTnt,
-        player: {
-          position: refs.camera.position.toArray() as [number, number, number],
-          rotation: [refs.camera.rotation.x, normalizeYaw(refs.camera.rotation.y), refs.camera.rotation.z],
-          health, hunger, oxygen, flying: refs.player.flying,
-        },
-        timeOfDay: ((refs.timeOfDay % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2),
-        drops: refs.mobManager.droppedItems.filter(d => d.life > 0).map(d => ({
-          itemId: d.itemId, count: d.count, durability: d.durability,
-          position: d.position.toArray() as [number, number, number],
-          velocity: d.velocity.toArray() as [number, number, number], life: d.life,
-        })),
-      });
-      await saveGame(snapshot, persistence.lastSavedAt);
+      const snapshot = captureCurrentGame();
+      if (!snapshot) return;
+      await storage.save(snapshot, persistence.lastSavedAt);
       persistence.lastSavedAt = snapshot.savedAt;
       setStorageError(false);
       setStorageStatus(`保存しました（${new Date(snapshot.savedAt).toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo' })}）`);
@@ -239,252 +249,292 @@ export default function App() {
     if (!canvasRef.current) return;
     const canvas = canvasRef.current;
 
-    // 1. Scene, Camera, Renderer
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x87ceeb);
-    scene.fog = new THREE.Fog(0x87ceeb, 18, 38);
-
-    const camera = new THREE.PerspectiveCamera(fov, window.innerWidth / window.innerHeight, 0.1, 1000);
-    camera.position.set(8, 12, 8);
-    camera.rotation.order = 'YXZ';
-
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.15;
-
-    // 2. High Fidelity Shader Environment (Volumetric Clouds, Sun/Moon Corona, Starfield, Dynamic GI)
-    const environment = new ShaderEnvironment(scene, camera);
-
-    // 3. PointerLockControls
-    const controls = new PointerLockControls(camera, canvas);
-
-    controls.addEventListener('lock', () => {
-      setItemMessage('');
-      setPlaying(true);
-      setModal(null);
-      sound.unlock();
-    });
-
-    controls.addEventListener('unlock', () => {
-      if (!touchEnabledRef.current) setPlaying(false);
-      resetControls();
-    });
-
-    // 4. Texture Atlas & World
-    const atlas = buildGameTextures();
-    const world = new VoxelWorld(scene, atlas);
-    const mobManager = new MobManager(scene, world);
-
-
-    const clock = new THREE.Clock();
-
-    const refs = {
-      scene,
-      camera,
-      renderer,
-      controls,
-      environment,
-      atlas,
-      world,
-      mobManager,
-      clock,
-      moveState: { forward: false, backward: false, left: false, right: false, jump: false, sprint: false },
-      player: {
-        velocity: new THREE.Vector3(),
-        onGround: false,
-        height: 1.62,
-        radius: 0.32,
-        flying: false,
-      },
-      timeOfDay: Math.PI / 2, // Noon
-      breakProgress: {
-        pos: null as THREE.Vector3 | null,
-        stage: 0,
-        timer: 0,
-        maxDuration: 0.5,
-        signature: '',
-      },
-      isNight: false,
-    };
-    threeRefs.current = refs;
-    world.onBlockRemoved = (x, y, z, type) => {
-      const key = world.getKey(x, y, z), state = itemsRef.current;
-      const furnace = type === BLOCKS.FURNACE ? state.furnaces[key] : null;
-      const chest = type === BLOCKS.CHEST ? state.chests[key] : null;
-      if (!furnace && !chest) return;
-      const contents = furnace ? [furnace.input, furnace.fuel, furnace.output] : chest!;
-      for (const value of contents) if (value.itemId) mobManager.spawnDroppedItem(value.itemId, value.count, new THREE.Vector3(x + 0.5, y + 0.5, z + 0.5), value.durability);
-      updateItems(state => {
-        const furnaces = { ...state.furnaces }, chests = { ...state.chests };
-        delete furnaces[key]; delete chests[key]; return { ...state, furnaces, chests };
-      });
-    };
+    const scope = new CleanupScope();
     let disposed = false;
-    const initializeSave = async () => {
-      let restored: GameSave | null = null;
-      try {
-        restored = await loadGame();
-        if (disposed) return;
-        persistenceRef.current.canWrite = true;
-        persistenceRef.current.lastSavedAt = restored?.savedAt ?? null;
-      } catch (error) {
-        if (disposed) return;
-        // A failed load must never replace an existing save with a fresh world.
-        persistenceRef.current.canWrite = false;
-        setStorageError(true);
-        setStorageStatus(`${error instanceof Error ? error.message : '保存データを読み込めませんでした。'} 保存を停止しています。再読み込みして確認してください。`);
+    let failed = false;
+    let animId = 0;
+    setIsReady(false);
+    const fail = (error: unknown) => {
+      if (disposed || failed) return;
+      failed = true;
+      if (persistenceRef.current.initialized) {
+        try { recoverySnapshotRef.current = captureCurrentGame(); } catch {}
       }
-      if (disposed) return;
-      if (restored) {
-        world.importSaveData(restored.world);
-        world.renderDistance = restored.settings.renderDist;
-        camera.position.fromArray(restored.player.position);
-        camera.rotation.set(restored.player.rotation[0], restored.player.rotation[1], 0, 'YXZ');
-        world.primedTnt = restored.primedTnt;
-        refs.timeOfDay = restored.timeOfDay;
-        refs.player.flying = restored.settings.gameMode === 'creative' && restored.player.flying;
-        setHealth(restored.player.health);
-        setHunger(restored.player.hunger);
-        setOxygen(restored.player.oxygen);
-        updateItems(() => ({ inventory: restored.inventory, cursorItem: restored.cursorItem,
-          craft2x2: restored.craft2x2, craft3x3: restored.craft3x3,
-          furnaces: restored.furnaces, legacyFurnace: restored.legacyFurnace,
-          chests: restored.chests, legacyChest: restored.legacyChest }));
-        setActiveSlot(restored.activeSlot);
-        setAchievements(INITIAL_ACHIEVEMENTS.map(a => ({ ...a, unlocked: restored.achievements.includes(a.id) })));
-        setGameMode(restored.settings.gameMode);
-        setSoundEnabled(restored.settings.soundEnabled);
-        setMusicEnabled(restored.settings.musicEnabled);
-        setFov(restored.settings.fov);
-        setRenderDist(restored.settings.renderDist);
-        setPeaceful(restored.settings.peaceful);
-        for (const drop of restored.drops) {
-          mobManager.spawnDroppedItem(drop.itemId, drop.count, new THREE.Vector3(...drop.position), drop.durability);
-          const entity = mobManager.droppedItems[mobManager.droppedItems.length - 1];
-          entity.position.fromArray(drop.position);
-          entity.velocity.fromArray(drop.velocity);
-          entity.life = drop.life;
-        }
-        setStorageStatus(`続きから再開できます（${new Date(restored.savedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}）`);
-      } else {
-        camera.position.copy(findSafeSpawn(world));
-        if (persistenceRef.current.canWrite) setStorageStatus('30秒ごとに自動保存します。設定画面から手動でも保存できます。');
-      }
-      world.updateChunks(camera.position);
-      // Earlier saves placed the eye only 2.5 blocks above terrain, embedding the feet.
-      // Lift only an overlapping player, so normal saved positions remain untouched.
-      for (let attempt = 0; attempt < 64; attempt++) {
-        let floor = -Infinity;
-        for (let x = Math.floor(camera.position.x - refs.player.radius); x <= Math.floor(camera.position.x + refs.player.radius); x++) {
-          for (let z = Math.floor(camera.position.z - refs.player.radius); z <= Math.floor(camera.position.z + refs.player.radius); z++) {
-            for (let y = Math.floor(camera.position.y - refs.player.height); y <= Math.floor(camera.position.y + 0.1); y++) {
-              const block = world.getBlock(x, y, z);
-              if (block && BLOCK_DEFS[block]?.isSolid) floor = Math.max(floor, y + 1);
-            }
-          }
-        }
-        if (!Number.isFinite(floor)) break;
-        camera.position.y = floor + refs.player.height + 0.01;
-      }
-      const { biome } = world.getTerrainHeight(camera.position.x, camera.position.z);
-      setCoords({ x: Math.floor(camera.position.x), y: Math.floor(camera.position.y), z: Math.floor(camera.position.z), biome });
-      const hours = Math.floor(((refs.timeOfDay / (Math.PI * 2)) * 24 + 6) % 24);
-      const minutes = Math.floor((refs.timeOfDay / (Math.PI * 2)) * 24 * 60 % 60);
-      setTimeString(`${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`);
-      environment.update(0, refs.timeOfDay, camera.position);
-      persistenceRef.current.initialized = true;
-      clock.getDelta();
-      setIsReady(true);
+      persistenceRef.current.initialized = false;
+      resetControls(); setPlaying(false); setModal(null);
+      threeRefs.current?.controls.unlock();
+      cancelAnimationFrame(animId);
+      setIsReady(false);
+      setFatalError(error instanceof Error ? error.message : '描画またはワールドの準備に失敗しました。');
     };
-    void initializeSave();
-
-    // Window Resize Handler
-    const handleResize = () => {
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight);
-    };
-    window.addEventListener('resize', handleResize);
-
-    // Main Game Animation Loop
-    let animId: number;
-    let uiTimer = 0;
-    const stepper = new FixedStepper();
-
-    const animate = () => {
-      animId = requestAnimationFrame(animate);
-      const delta = Math.min(clock.getDelta(), 0.08);
-
-      const ready = persistenceRef.current.initialized && !document.hidden;
-      const active = ready && playingRef.current && !openModalRef.current;
-      stepper.advance(delta, active, dt => {
-        if (!playingRef.current) return;
-        sessionRef.current.advance(dt);
-        updateItems(state => {
-          let changed = false;
-          const furnaces = { ...state.furnaces };
-          for (const [key, furnace] of Object.entries(furnaces)) {
-            const next = stepFurnace(furnace, dt);
-            if (next !== furnace) { furnaces[key] = next; changed = true; }
-          }
-          return changed ? { ...state, furnaces } : state;
-        }, false);
-        refs.world.updateTnt(dt);
-        updateGame(dt, refs);
-        if (playingRef.current) processPrimary(dt, refs);
-      });
-      uiTimer += delta;
-      if (uiTimer >= 0.1) {
-        uiTimer = 0;
-        publishItems();
-        setHealthView(sessionRef.current.health); setHungerView(sessionRef.current.hunger); setOxygenView(sessionRef.current.oxygen);
-        const { biome } = world.getTerrainHeight(camera.position.x, camera.position.z);
-        const x = Math.floor(camera.position.x), y = Math.floor(camera.position.y), z = Math.floor(camera.position.z);
-        setCoords(previous => previous.x === x && previous.y === y && previous.z === z && previous.biome === biome ? previous : { x, y, z, biome });
-        const hours = Math.floor(((refs.timeOfDay / (Math.PI * 2)) * 24 + 6) % 24);
-        const minutes = Math.floor((refs.timeOfDay / (Math.PI * 2)) * 24 * 60 % 60);
-        setTimeString(`${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`);
-        setLumenPercent(Math.round(Math.max(0.08, Math.sin(refs.timeOfDay)) * 100));
-        const progress = refs.breakProgress;
-        const percent = progress.pos ? Math.min(100, progress.timer / progress.maxDuration * 100) : 0;
-        const label = miningHintRef.current;
-        setMiningView(previous => previous.percent === percent && previous.label === label ? previous : { percent, label });
-      }
-
-      renderer.render(scene, camera);
-    };
-    animate();
-
-    return () => {
+    initializationFailureRef.current = fail;
+    const cleanup = () => {
       disposed = true;
       persistenceRef.current.initialized = false;
       cancelAnimationFrame(animId);
-      window.removeEventListener('resize', handleResize);
-      controls.dispose();
-      mobManager.dispose(); world.dispose();
-      disposeObjects([...scene.children], true);
-      for (const tex of new Set([...Object.values(atlas.textures), ...atlas.crackTextures])) tex.dispose();
-      renderer.dispose(); threeRefs.current = null;
+      sound.stopMusic(); scope.dispose(); threeRefs.current = null; initializationFailureRef.current = null;
     };
-  }, []);
+    try {
+      // 1. Scene, Camera, Renderer
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x87ceeb);
+      scene.fog = new THREE.Fog(0x87ceeb, 18, 38);
+
+      const camera = new THREE.PerspectiveCamera(fov, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.set(8, 12, 8);
+      camera.rotation.order = 'YXZ';
+
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+      scope.own(() => renderer.dispose());
+      scope.own(() => disposeObjects([...scene.children], true));
+      const contextLost = (event: Event) => {
+        event.preventDefault(); fail(new Error('描画が中断されました。進行はメモリに保持しています。「再試行」で画面を作り直せます。'));
+      };
+      canvas.addEventListener('webglcontextlost', contextLost);
+      scope.own(() => canvas.removeEventListener('webglcontextlost', contextLost));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.15;
+
+      // 2. High Fidelity Shader Environment (Volumetric Clouds, Sun/Moon Corona, Starfield, Dynamic GI)
+      const environment = new ShaderEnvironment(scene, camera);
+
+      // 3. PointerLockControls
+      const controls = new PointerLockControls(camera, canvas);
+      scope.own(() => controls.dispose());
+
+      controls.addEventListener('lock', () => {
+        setItemMessage('');
+        setPlaying(true);
+        setModal(null);
+        sound.unlock();
+      });
+
+      controls.addEventListener('unlock', () => {
+        if (!touchEnabledRef.current) setPlaying(false);
+        resetControls();
+      });
+
+      // 4. Texture Atlas & World
+      const atlas = buildGameTextures();
+      scope.own(() => { for (const texture of new Set([...Object.values(atlas.textures), ...atlas.crackTextures])) texture.dispose(); });
+      const world = new VoxelWorld(scene, atlas);
+      scope.own(() => world.dispose());
+      const mobManager = new MobManager(scene, world);
+      scope.own(() => mobManager.dispose());
+
+
+      const clock = new THREE.Clock();
+
+      const refs = {
+        scene,
+        camera,
+        renderer,
+        controls,
+        environment,
+        atlas,
+        world,
+        mobManager,
+        clock,
+        moveState: { forward: false, backward: false, left: false, right: false, jump: false, sprint: false, sneak: false },
+        player: {
+          velocity: new THREE.Vector3(),
+          onGround: false,
+          height: 1.62,
+          radius: 0.32,
+          flying: false,
+          fallDistance: 0,
+        },
+        timeOfDay: Math.PI / 2, // Noon
+        breakProgress: {
+          pos: null as THREE.Vector3 | null,
+          stage: 0,
+          timer: 0,
+          maxDuration: 0.5,
+          signature: '',
+        },
+        isNight: false,
+      };
+      threeRefs.current = refs;
+      world.onBlockRemoved = (x, y, z, type) => {
+        const key = world.getKey(x, y, z), state = itemsRef.current;
+        const furnace = type === BLOCKS.FURNACE ? state.furnaces[key] : null;
+        const chest = type === BLOCKS.CHEST ? state.chests[key] : null;
+        if (!furnace && !chest) return;
+        const contents = furnace ? [furnace.input, furnace.fuel, furnace.output] : chest!;
+        for (const value of contents) if (value.itemId) mobManager.spawnDroppedItem(value.itemId, value.count, new THREE.Vector3(x + 0.5, y + 0.5, z + 0.5), value.durability);
+        updateItems(state => {
+          const furnaces = { ...state.furnaces }, chests = { ...state.chests };
+          delete furnaces[key]; delete chests[key]; return { ...state, furnaces, chests };
+        });
+      };
+      const initializeSave = async () => {
+        let restored: GameSave | null = null;
+        try {
+          const recovery = recoverySnapshotRef.current;
+          restored = recovery ?? await storage.load();
+          if (disposed || failed) return;
+          if (!recovery) {
+            persistenceRef.current.canWrite = true;
+            persistenceRef.current.lastSavedAt = restored?.savedAt ?? null;
+          }
+        } catch (error) {
+          if (disposed || failed) return;
+          // A failed load must never replace an existing save with a fresh world.
+          persistenceRef.current.canWrite = false;
+          setStorageError(true);
+          setStorageStatus(`${error instanceof Error ? error.message : '保存データを読み込めませんでした。'} 保存を停止しています。再読み込みして確認してください。`);
+        }
+        if (disposed || failed) return;
+        if (restored) {
+          world.importSaveData(restored.world);
+          world.renderDistance = restored.settings.renderDist;
+          camera.fov = restored.settings.fov; camera.updateProjectionMatrix();
+          camera.position.fromArray(restored.player.position);
+          camera.rotation.set(restored.player.rotation[0], restored.player.rotation[1], 0, 'YXZ');
+          world.primedTnt = restored.primedTnt;
+          refs.timeOfDay = restored.timeOfDay;
+          refs.player.flying = restored.settings.gameMode === 'creative' && restored.player.flying;
+          setHealth(restored.player.health);
+          setHunger(restored.player.hunger);
+          setOxygen(restored.player.oxygen);
+          updateItems(() => ({ inventory: restored.inventory, cursorItem: restored.cursorItem,
+            craft2x2: restored.craft2x2, craft3x3: restored.craft3x3,
+            furnaces: restored.furnaces, legacyFurnace: restored.legacyFurnace,
+            chests: restored.chests, legacyChest: restored.legacyChest }));
+          setActiveSlot(restored.activeSlot);
+          setAchievements(INITIAL_ACHIEVEMENTS.map(a => ({ ...a, unlocked: restored.achievements.includes(a.id) })));
+          setGameMode(restored.settings.gameMode);
+          setSoundEnabled(restored.settings.soundEnabled);
+          setMusicEnabled(restored.settings.musicEnabled);
+          setFov(restored.settings.fov);
+          setRenderDist(restored.settings.renderDist);
+          setPeaceful(restored.settings.peaceful);
+          for (const drop of restored.drops) {
+            mobManager.spawnDroppedItem(drop.itemId, drop.count, new THREE.Vector3(...drop.position), drop.durability);
+            const entity = mobManager.droppedItems[mobManager.droppedItems.length - 1];
+            entity.position.fromArray(drop.position);
+            entity.velocity.fromArray(drop.velocity);
+            entity.life = drop.life;
+          }
+          setStorageStatus(`続きから再開できます（${new Date(restored.savedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}）`);
+        } else {
+          camera.position.copy(findSafeSpawn(world));
+          if (persistenceRef.current.canWrite) setStorageStatus('30秒ごとに自動保存します。設定画面から手動でも保存できます。');
+        }
+        world.updateChunks(camera.position);
+        // Earlier saves placed the eye only 2.5 blocks above terrain, embedding the feet.
+        // Lift only an overlapping player, so normal saved positions remain untouched.
+        for (let attempt = 0; attempt < 64; attempt++) {
+          let floor = -Infinity;
+          for (let x = Math.floor(camera.position.x - refs.player.radius); x <= Math.floor(camera.position.x + refs.player.radius); x++) {
+            for (let z = Math.floor(camera.position.z - refs.player.radius); z <= Math.floor(camera.position.z + refs.player.radius); z++) {
+              for (let y = Math.floor(camera.position.y - refs.player.height); y <= Math.floor(camera.position.y + 0.1); y++) {
+                const block = world.getBlock(x, y, z);
+                if (block && BLOCK_DEFS[block]?.isSolid) floor = Math.max(floor, y + 1);
+              }
+            }
+          }
+          if (!Number.isFinite(floor)) break;
+          camera.position.y = floor + refs.player.height + 0.01;
+        }
+        const { biome } = world.getTerrainHeight(camera.position.x, camera.position.z);
+        setCoords({ x: Math.floor(camera.position.x), y: Math.floor(camera.position.y), z: Math.floor(camera.position.z), biome });
+        const hours = Math.floor(((refs.timeOfDay / (Math.PI * 2)) * 24 + 6) % 24);
+        const minutes = Math.floor((refs.timeOfDay / (Math.PI * 2)) * 24 * 60 % 60);
+        setTimeString(`${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`);
+        environment.update(0, refs.timeOfDay, camera.position);
+        if (scene.fog instanceof THREE.Fog) Object.assign(scene.fog, viewFog(world.renderDistance));
+        persistenceRef.current.initialized = true;
+        clock.getDelta();
+        recoverySnapshotRef.current = null;
+        setFatalError(null);
+        setIsReady(true);
+      };
+      void initializeSave().catch(fail);
+
+      // Window Resize Handler
+      const handleResize = () => {
+        try {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        } catch (error) { fail(error); }
+      };
+      window.addEventListener('resize', handleResize);
+      scope.own(() => window.removeEventListener('resize', handleResize));
+
+      // Main Game Animation Loop
+      let uiTimer = 0;
+      const stepper = new FixedStepper();
+
+      const animate = () => {
+        if (disposed || failed) return;
+        try {
+          animId = requestAnimationFrame(animate);
+          const delta = Math.min(clock.getDelta(), 0.08);
+
+          const ready = persistenceRef.current.initialized && !document.hidden;
+          const active = ready && playingRef.current && !openModalRef.current;
+          stepper.advance(delta, active, dt => {
+            if (!playingRef.current) return;
+            sessionRef.current.advance(dt);
+            updateItems(state => {
+              let changed = false;
+              const furnaces = { ...state.furnaces };
+              for (const [key, furnace] of Object.entries(furnaces)) {
+                const next = stepFurnace(furnace, dt);
+                if (next !== furnace) { furnaces[key] = next; changed = true; }
+              }
+              return changed ? { ...state, furnaces } : state;
+            }, false);
+            refs.world.updateTnt(dt);
+            updateGame(dt, refs);
+            if (playingRef.current) processPrimary(dt, refs);
+          });
+          uiTimer += delta;
+          if (uiTimer >= 0.1) {
+            uiTimer = 0;
+            publishItems();
+            setHealthView(sessionRef.current.health); setHungerView(sessionRef.current.hunger); setOxygenView(sessionRef.current.oxygen);
+            const { biome } = world.getTerrainHeight(camera.position.x, camera.position.z);
+            const x = Math.floor(camera.position.x), y = Math.floor(camera.position.y), z = Math.floor(camera.position.z);
+            setCoords(previous => previous.x === x && previous.y === y && previous.z === z && previous.biome === biome ? previous : { x, y, z, biome });
+            const hours = Math.floor(((refs.timeOfDay / (Math.PI * 2)) * 24 + 6) % 24);
+            const minutes = Math.floor((refs.timeOfDay / (Math.PI * 2)) * 24 * 60 % 60);
+            setTimeString(`${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`);
+            const progress = refs.breakProgress;
+            const percent = progress.pos ? Math.min(100, progress.timer / progress.maxDuration * 100) : 0;
+            const label = miningHintRef.current;
+            setMiningView(previous => previous.percent === percent && previous.label === label ? previous : { percent, label });
+          }
+
+          renderer.render(scene, camera);
+        } catch (error) { fail(error); }
+      };
+      animate();
+
+    } catch (error) { fail(error); scope.dispose(); }
+    return cleanup;
+  }, [initialization]);
 
   // Update FOV & Render Distance dynamically
   useEffect(() => {
-    if (threeRefs.current) {
-      threeRefs.current.camera.fov = fov;
-      threeRefs.current.camera.updateProjectionMatrix();
-      threeRefs.current.world.renderDistance = renderDist;
-      if (threeRefs.current.scene.fog instanceof THREE.Fog) {
-        threeRefs.current.scene.fog.near = renderDist * 9;
-        threeRefs.current.scene.fog.far = renderDist * 16 + 6;
-      }
-      threeRefs.current.world.updateChunks(threeRefs.current.camera.position);
+    if (threeRefs.current && persistenceRef.current.initialized) {
+      try {
+        threeRefs.current.camera.fov = fov;
+        threeRefs.current.camera.updateProjectionMatrix();
+        threeRefs.current.world.renderDistance = renderDist;
+        if (threeRefs.current.scene.fog instanceof THREE.Fog) {
+          Object.assign(threeRefs.current.scene.fog, viewFog(renderDist));
+        }
+        threeRefs.current.world.updateChunks(threeRefs.current.camera.position);
+      } catch (error) { initializationFailureRef.current?.(error); }
     }
-  }, [fov, renderDist]);
+  }, [fov, renderDist, isReady]);
 
   // Sound settings sync
   useEffect(() => {
@@ -507,8 +557,8 @@ export default function App() {
     miningHintRef.current = '';
     const refs = threeRefs.current;
     if (!refs) return;
-    Object.assign(refs.moveState, { forward: false, backward: false, left: false, right: false, jump: false, sprint: false });
-    refs.player.velocity.set(0, 0, 0);
+    Object.assign(refs.moveState, { forward: false, backward: false, left: false, right: false, jump: false, sprint: false, sneak: false });
+    // Pausing clears held input, while the suspended simulation retains fall momentum.
     refs.breakProgress.pos = null;
     refs.breakProgress.timer = 0;
     refs.world.setCrackStage(null, -1);
@@ -577,6 +627,7 @@ export default function App() {
     if (!refs || sessionRef.current.phase !== 'dead') return;
     const position = findSafeSpawn(refs.world);
     refs.camera.position.copy(position); resetPlayerView(refs.camera, refs.player); resetControls();
+    refs.player.fallDistance = 0;
     drownTimerRef.current = 0; swimSoundTimerRef.current = 0; wasInWaterRef.current = false;
     setIsUnderwater(false); sessionRef.current.respawn(); setIsDead(false);
     setHealthView(20); setHungerView(20); setOxygenView(10);
@@ -617,7 +668,9 @@ export default function App() {
     wasInWaterRef.current = inWater;
 
     // 3. Player Movement Physics (True World Coordinates - No Camera Pitch/Yaw Inversion)
-    const speed = inWater ? (moveState.sprint ? 5.5 : 3.8) : (moveState.sprint ? 9.5 : 6.0);
+    const creative = gameModeRef.current === 'creative';
+    const sprinting = moveState.sprint && !moveState.sneak && (creative || sessionRef.current.hunger > 6);
+    const speed = player.flying ? (sprinting ? 16 : 10) : inWater ? 2.2 : moveState.sneak ? SNEAK_SPEED : sprinting ? SPRINT_SPEED : WALK_SPEED;
 
     if (inWater) {
       // Fluid viscosity / drag (Navier-Stokes linear/quadratic drag)
@@ -638,113 +691,49 @@ export default function App() {
           swimSoundTimerRef.current = 0;
         }
       }
-      if (moveState.sprint) {
-        // Shift key dives downward
+      if (moveState.sneak) {
+        // Sneak dives downward
         player.velocity.y = Math.max(player.velocity.y - 12.0 * delta, -3.8);
       }
     } else {
-      const gravity = player.flying ? 0 : 25.0;
-      player.velocity.x -= player.velocity.x * 10.0 * delta;
-      player.velocity.z -= player.velocity.z * 10.0 * delta;
+      const gravity = player.flying ? 0 : 32.0;
       player.velocity.y = Math.max(-30, player.velocity.y - gravity * delta);
       if (player.flying) {
         player.velocity.y -= player.velocity.y * 8.0 * delta;
       }
     }
 
-    // Compute stable horizontal forward and right vectors from camera
-    // Projecting look direction onto XZ plane prevents pitch gimbal lock / yaw flip
-    const forward = new THREE.Vector3();
-    camera.getWorldDirection(forward);
-    forward.y = 0;
-    if (forward.lengthSq() < 0.0001) {
-      forward.set(0, 0, -1);
-    } else {
-      forward.normalize();
+    // Yaw-only basis: looking vertically never reverses horizontal movement.
+    const yaw = camera.rotation.y;
+    const inputX = Number(moveState.right) - Number(moveState.left) + touchMoveRef.current.x;
+    const inputZ = Number(moveState.forward) - Number(moveState.backward) - touchMoveRef.current.z;
+    const magnitude = Math.max(1, Math.hypot(inputX, inputZ));
+    const desiredX = (inputX * Math.cos(yaw) - inputZ * Math.sin(yaw)) / magnitude * speed;
+    const desiredZ = (-inputX * Math.sin(yaw) - inputZ * Math.cos(yaw)) / magnitude * speed;
+    const blend = 1 - Math.exp(-12 * delta);
+    player.velocity.x += (desiredX - player.velocity.x) * blend;
+    player.velocity.z += (desiredZ - player.velocity.z) * blend;
+    const moving = Math.hypot(player.velocity.x, player.velocity.z) > 0.2;
+    if (moving && player.onGround && !inWater && !moveState.sneak) {
+      stepSoundRef.current += Math.hypot(player.velocity.x, player.velocity.z) * delta;
+      if (stepSoundRef.current >= 1.8) { stepSoundRef.current %= 1.8; sound.playStep('grass'); }
     }
-
-    // Right vector is perpendicular to forward on XZ plane: (forward x UP)
-    const right = new THREE.Vector3();
-    right.crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
-
-    // Sum movement directions in world space
-    const inputVec = new THREE.Vector3();
-    if (moveState.forward) inputVec.add(forward);
-    if (moveState.backward) inputVec.sub(forward);
-    if (moveState.right) inputVec.add(right);
-    if (moveState.left) inputVec.sub(right);
-    inputVec.addScaledVector(forward, -touchMoveRef.current.z);
-    inputVec.addScaledVector(right, touchMoveRef.current.x);
-
-    if (inputVec.lengthSq() > 0) {
-      const strength = Math.min(1, inputVec.length());
-      inputVec.normalize().multiplyScalar(strength);
-      const accel = inWater ? 6.0 : 10.0;
-      player.velocity.x += inputVec.x * speed * accel * delta;
-      player.velocity.z += inputVec.z * speed * accel * delta;
-
-      // Play step sound
-      if (!inWater && player.onGround && Math.random() < 1 - Math.exp(-7.2 * delta)) {
-        sound.playStep('grass');
-        // Drain tiny hunger on move
-        setHunger((h) => Math.max(0, h - delta * 0.08));
-      }
-    }
-
-    if (player.flying) player.velocity.y = moveState.jump ? 8 : moveState.sprint ? -8 : 0;
+    if (!creative) sessionRef.current.survival(delta, moving ? Math.hypot(player.velocity.x, player.velocity.z) : 0, sprinting, handlePlayerDamage);
+    if (player.flying) player.velocity.y = moveState.jump ? 8 : moveState.sneak ? -8 : 0;
     else if (!inWater && moveState.jump && player.onGround) {
-      player.velocity.y = 8.8;
-      setHunger(h => Math.max(0, h - 0.08));
+      player.velocity.y = 9;
+      if (!creative) sessionRef.current.exhaust(sprinting ? 0.2 : 0.05);
     }
-
-    // Direct translation in world coordinates
-    const moveVec = new THREE.Vector3(player.velocity.x * delta, 0, player.velocity.z * delta);
-
-    // Collision check helper
-    const checkCollision = (pos: THREE.Vector3) => {
-      const minX = Math.floor(pos.x - player.radius);
-      const maxX = Math.floor(pos.x + player.radius);
-      const minY = Math.floor(pos.y - player.height);
-      const maxY = Math.floor(pos.y + 0.1);
-      const minZ = Math.floor(pos.z - player.radius);
-      const maxZ = Math.floor(pos.z + player.radius);
-
-      for (let x = minX; x <= maxX; x++) {
-        for (let y = minY; y <= maxY; y++) {
-          for (let z = minZ; z <= maxZ; z++) {
-            const block = world.getBlock(x, y, z);
-            if (block && BLOCK_DEFS[block]?.isSolid) {
-              return true;
-            }
-          }
-        }
+    const beforeY = camera.position.y;
+    const wasGrounded = player.onGround;
+    player.onGround = movePlayer(world, camera.position, player.velocity, delta, player, moveState.sneak, wasGrounded);
+    if (inWater || player.flying) player.fallDistance = 0;
+    else {
+      player.fallDistance += Math.max(0, beforeY - camera.position.y);
+      if (player.onGround) {
+        if (player.fallDistance > 3.5) handlePlayerDamage(Math.ceil(player.fallDistance - 3), '落下');
+        player.fallDistance = 0;
       }
-      return false;
-    };
-
-    // Apply X
-    camera.position.x += moveVec.x;
-    if (checkCollision(camera.position)) {
-      camera.position.x -= moveVec.x;
-      player.velocity.x = 0;
-    }
-
-    // Apply Z
-    camera.position.z += moveVec.z;
-    if (checkCollision(camera.position)) {
-      camera.position.z -= moveVec.z;
-      player.velocity.z = 0;
-    }
-
-    // Apply Y (Vertical)
-    camera.position.y += player.velocity.y * delta;
-    player.onGround = false;
-    if (checkCollision(camera.position)) {
-      if (player.velocity.y < 0) {
-        player.onGround = true;
-      }
-      camera.position.y -= player.velocity.y * delta;
-      player.velocity.y = 0;
     }
 
     // Void fall safety
@@ -781,8 +770,7 @@ export default function App() {
     } else {
       if (refs.scene.fog instanceof THREE.Fog) {
         refs.scene.fog.color.setHex(isNight ? 0x050b14 : 0x87ceeb);
-        refs.scene.fog.near = 18.0;
-        refs.scene.fog.far = 38.0;
+        Object.assign(refs.scene.fog, viewFog(world.renderDistance));
       }
       setOxygen(10);
       drownTimerRef.current = 0;
@@ -823,7 +811,8 @@ export default function App() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!persistenceRef.current.initialized || sessionRef.current.phase === 'dead') return;
-      if (e.repeat && ['KeyE', 'KeyF', 'Escape'].includes(e.code)) return;
+      if (e.repeat && ['KeyE', 'KeyF', 'F3', 'Escape'].includes(e.code)) return;
+      if (e.code === 'F3') { e.preventDefault(); setShowDebug(value => !value); return; }
       // Toggle inventory with 'E'
       if (e.code === 'KeyE') {
         e.preventDefault();
@@ -849,6 +838,7 @@ export default function App() {
       if (!refs || !playingRef.current || openModalRef.current) return;
 
       const { moveState, player } = refs;
+      if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight'].includes(e.code)) e.preventDefault();
       switch (e.code) {
         case 'KeyW':
           moveState.forward = true;
@@ -862,8 +852,13 @@ export default function App() {
         case 'KeyD':
           moveState.right = true;
           break;
+        case 'ControlLeft':
+        case 'ControlRight':
+          e.preventDefault(); moveState.sprint = true;
+          break;
         case 'ShiftLeft':
-          moveState.sprint = true;
+        case 'ShiftRight':
+          moveState.sneak = true;
           break;
         case 'Space':
           moveState.jump = true;
@@ -908,8 +903,13 @@ export default function App() {
         case 'KeyD':
           moveState.right = false;
           break;
-        case 'ShiftLeft':
+        case 'ControlLeft':
+        case 'ControlRight':
           moveState.sprint = false;
+          break;
+        case 'ShiftLeft':
+        case 'ShiftRight':
+          moveState.sneak = false;
           if (player.flying && player.velocity.y < 0) {
             player.velocity.y = 0;
           }
@@ -950,8 +950,8 @@ export default function App() {
     const next = updateItems(returnCursor);
     setItemMessage(next.cursorItem ? '空きが足りません。残りの品は持ったまま保持しています。' : '所持品へ戻しました。');
   };
-  const handleSlotClick = (index: number) => {
-    updateItems(state => clickInventory(state, index)); sound.playPop(); setItemMessage('');
+  const handleSlotClick = (index: number, secondary = false, quick = false) => {
+    updateItems(state => quick ? quickMoveInventory(state, index, openModalRef.current === 'chest' ? activeChestKey : null, openModalRef.current === 'furnace' ? activeFurnaceKey : null) : clickInventory(state, index, secondary)); sound.playPop(); setItemMessage('');
   };
   const handleCraftGridClick = (row: number, col: number, size: 2 | 3) => {
     const before = itemsRef.current;
@@ -977,10 +977,10 @@ export default function App() {
     setItemMessage(`${recipe.name}を制作しました。`); sound.playCraft();
     if (id === 'crafting_table') unlockAchievement('workbench');
   };
-  const handleFurnaceSlot = (kind: 'input' | 'fuel' | 'output') => {
+  const handleFurnaceSlot = (kind: 'input' | 'fuel' | 'output', secondary = false) => {
     if (!activeFurnaceKey) return;
     const before = itemsRef.current;
-    const next = updateItems(state => kind === 'output' ? collectFurnace(state, activeFurnaceKey) : clickFurnaceSlot(state, activeFurnaceKey, kind));
+    const next = updateItems(state => kind === 'output' ? collectFurnace(state, activeFurnaceKey) : clickFurnaceSlot(state, activeFurnaceKey, kind, secondary));
     setItemMessage(next === before ? kind === 'output' ? '回収できません。完成品や所持品の空きを確認してください。' : '所持品を持って、材料には精錬できる品、燃料には石炭・原木・木材・棒を入れてください。' : '');
     if (next !== before) sound.playPop();
     if (kind === 'output' && next !== before) unlockAchievement('furnace');
@@ -1019,8 +1019,8 @@ export default function App() {
       }
     }
     if (item?.foodRestore && slot.count > 0) {
+      if (sessionRef.current.hunger >= 20) { setItemMessage('満腹です。満腹度が高いと体力が自然回復します。'); return; }
       if (!creative) consume(index);
-      setHealth(h => Math.min(20, h + item.foodRestore!.health));
       setHunger(h => Math.min(20, h + item.foodRestore!.hunger)); sound.playEat(); return;
     }
     if (item?.toolType === 'bow') {
@@ -1115,6 +1115,7 @@ export default function App() {
   }, []);
   const handleTouchMine = useCallback((held: boolean) => { primaryHeldRef.current = held && playingRef.current; }, []);
   const handleTouchJump = useCallback((held: boolean) => { if (threeRefs.current) threeRefs.current.moveState.jump = held; }, []);
+  const handleTouchSneak = useCallback((held: boolean) => { if (threeRefs.current) threeRefs.current.moveState.sneak = held; }, []);
   const handleTouchSprint = useCallback((held: boolean) => { if (threeRefs.current) threeRefs.current.moveState.sprint = held; }, []);
 
   useEffect(() => {
@@ -1123,17 +1124,26 @@ export default function App() {
     return bindGameMouse(canvas, window,
       () => playingRef.current && !openModalRef.current,
       held => { primaryHeldRef.current = held; }, useItemAction);
-  }, [useItemAction]);
+  }, [useItemAction, initialization]);
 
 
   return (
     <div
-      className="relative w-full h-[100dvh] overflow-hidden bg-black select-none text-white font-sans"
+      className="voxel-game relative w-full h-[100dvh] overflow-hidden bg-black select-none text-white font-sans"
       onContextMenu={(e) => e.preventDefault()}
       onMouseMove={(e) => { if (itemsRef.current.cursorItem && openModalRef.current && !touchEnabledRef.current) setMousePos({ x: e.clientX, y: e.clientY }); }}
     >
       {/* 3D WebGL Canvas */}
-      <canvas ref={canvasRef} className="w-full h-full block cursor-crosshair touch-none" />
+      <canvas key={initialization} ref={canvasRef} className="w-full h-full block cursor-crosshair touch-none" />
+
+      {fatalError && <div className="game-overlay" style={{ zIndex: 80 }}>
+        <section role="alertdialog" aria-modal="true" aria-labelledby="startup-error" className="game-panel max-w-md space-y-4">
+          <h2 id="startup-error" className="text-lg font-bold">ゲームを開始・継続できません</h2>
+          <p className="text-sm">{fatalError}</p>
+          <p className="text-xs text-neutral-300">保存済みのワールドはそのまま残しています。ほかのタブを閉じると改善する場合があります。</p>
+          <button autoFocus className="game-button w-full min-h-12" onClick={() => { setFatalError(null); setInitialization(value => value + 1); }}>再試行</button>
+        </section>
+      </div>}
 
       {storageError && (
         <div role="alert" className="absolute bottom-36 left-4 right-4 z-30 mx-auto max-w-lg rounded-lg border border-amber-400/40 bg-neutral-950/95 p-3 text-xs text-amber-200 pointer-events-none">
@@ -1142,7 +1152,7 @@ export default function App() {
       )}
 
       {touchEnabled && <TouchControls active={isPlaying && !openModal} onMove={handleTouchMove} onLook={handleTouchLook}
-        onMine={handleTouchMine} onJump={handleTouchJump} onSprint={handleTouchSprint} onUse={useItemAction}
+        onMine={handleTouchMine} onJump={handleTouchJump} onSprint={handleTouchSprint} onSneak={handleTouchSneak} onUse={useItemAction}
         onMenu={() => openMenu('inventory')} onPause={() => openMenu('settings')}
         onFlight={gameMode === 'creative' ? () => { if (threeRefs.current) { threeRefs.current.player.flying = !threeRefs.current.player.flying; threeRefs.current.player.velocity.y = 0; } } : undefined} />}
       {isPlaying && (miningView.label || itemMessage || cursorItem?.itemId) && <div role="status" className="absolute top-24 sm:top-32 left-1/2 -translate-x-1/2 z-20 pointer-events-none max-w-[90vw] rounded-lg bg-black/75 px-3 py-2 text-xs text-center text-amber-100">
@@ -1176,10 +1186,10 @@ export default function App() {
       </div>
 
       {/* Top Left: Environment Diagnostics & Info */}
-      <div className={`${touchEnabled ? 'hidden' : 'hidden sm:block'} absolute top-4 left-4 z-20 pointer-events-none bg-black/60 backdrop-blur-md px-3.5 py-2.5 rounded-lg border border-white/10 font-mono text-xs shadow-lg space-y-1`}>
+      <div className={`${showDebug ? 'block' : 'hidden'} absolute top-4 left-4 z-20 pointer-events-none bg-black/60 backdrop-blur-md px-3.5 py-2.5 rounded-lg border border-white/10 font-mono text-xs shadow-lg space-y-1`}>
         <div className="flex items-center gap-2 text-emerald-400 font-bold tracking-wide">
           <Sparkles className="w-3.5 h-3.5" />
-          <span>VOXELVERSE v2.0 COMPLETE</span>
+          <span>VOXELVERSE · DEBUG [F3]</span>
         </div>
         <div className="text-gray-300 text-[11px] space-y-0.5">
           <p>
@@ -1233,7 +1243,7 @@ export default function App() {
 
       {/* Achievement / Toast Popup */}
       {toastMessage && (
-        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-50 bg-gradient-to-r from-amber-600/90 to-yellow-500/90 backdrop-blur-md border-2 border-yellow-300 px-6 py-3 rounded-xl shadow-2xl flex items-center gap-3 animate-bounce">
+        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-50 bg-gradient-to-r from-amber-600/90 to-yellow-500/90 backdrop-blur-md border-2 border-yellow-300 px-6 py-3 rounded-xl shadow-2xl flex items-center gap-3 motion-reduce:animate-none">
           <span className="text-3xl">{toastMessage.icon}</span>
           <div>
             <div className="text-[11px] font-bold uppercase tracking-wider text-amber-100">実績解除！</div>
@@ -1248,102 +1258,9 @@ export default function App() {
         <div className="pointer-events-none absolute inset-0 z-15 bg-gradient-to-b from-cyan-900/35 via-teal-800/25 to-blue-950/45 mix-blend-color-burn" />
       )}
 
-      {/* Oxygen Breath Bubbles Bar (Shown when swimming or oxygen < 10) */}
-      {(isUnderwater || oxygen < 10) && (
-        <div className="absolute bottom-28 left-1/2 -translate-x-1/2 z-20 pointer-events-none w-[420px] max-w-[92vw] flex justify-end items-center px-1">
-          <div className="flex items-center gap-1 bg-black/60 px-2 py-1 rounded-lg backdrop-blur-md border border-cyan-400/30 shadow-lg">
-            <span className="text-[10px] font-mono text-cyan-300 font-bold mr-1 tracking-wider">OXYGEN</span>
-            {Array.from({ length: 10 }).map((_, i) => {
-              const hasBubble = oxygen > i;
-              return (
-                <div key={i} className="relative w-3.5 h-3.5 flex items-center justify-center">
-                  {hasBubble ? (
-                    <span className="text-xs select-none animate-pulse">🫧</span>
-                  ) : (
-                    <span className="text-xs select-none opacity-20">⚪</span>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {touchEnabled && <div aria-label="プレイヤーの状態" className="absolute bottom-[calc(5.25rem+env(safe-area-inset-bottom))] left-1/2 -translate-x-1/2 z-20 w-[90vw] max-w-[420px] flex justify-between rounded-lg bg-black/70 px-3 py-1 text-xs pointer-events-none">
-        <span>HP {Math.ceil(health)} / 20</span><span>満腹 {Math.ceil(hunger)} / 20</span>
-      </div>}
-      {/* HUD: Hearts & Hunger Bars */}
-      <div className={`${touchEnabled ? 'hidden' : 'flex'} absolute bottom-20 left-1/2 -translate-x-1/2 z-20 pointer-events-none w-[420px] max-w-[92vw] justify-between items-center px-1`}>
-        {/* Health Hearts (10 Hearts) */}
-        <div className="flex gap-1">
-          {Array.from({ length: 10 }).map((_, i) => {
-            const heartVal = health - i * 2;
-            return (
-              <div key={i} className="relative w-4 h-4">
-                <span className="text-xs opacity-30 select-none">🖤</span>
-                {heartVal >= 2 && <span className="absolute inset-0 text-xs text-red-500 select-none">❤️</span>}
-                {heartVal === 1 && <span className="absolute inset-0 text-xs text-red-400 select-none opacity-80">💔</span>}
-              </div>
-            );
-          })}
-        </div>
-
-        {/* Hunger Drumsticks (10 Icons) */}
-        <div className="flex gap-1">
-          {Array.from({ length: 10 }).map((_, i) => {
-            const hungerVal = hunger - i * 2;
-            return (
-              <div key={i} className="relative w-4 h-4">
-                <span className="text-xs opacity-30 select-none">🦴</span>
-                {hungerVal >= 2 && <span className="absolute inset-0 text-xs text-amber-500 select-none">🍗</span>}
-                {hungerVal === 1 && <span className="absolute inset-0 text-xs text-amber-400 select-none opacity-80">🍖</span>}
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Bottom Hotbar (9 Slots) */}
-      <div className="absolute bottom-[max(1rem,env(safe-area-inset-bottom))] left-1/2 -translate-x-1/2 z-20 flex gap-1 p-1.5 max-w-[calc(100vw-1rem)] overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden touch-pan-x bg-black/75 backdrop-blur-md rounded-xl border border-white/20 shadow-2xl">
-        {inventory.slice(0, 9).map((slot, idx) => {
-          const isActive = idx === activeSlot;
-          const item = slot.itemId ? ITEMS[slot.itemId] : null;
-          const texUrl = item && threeRefs.current ? threeRefs.current.atlas.dataUrls[item.textureId] : null;
-
-          return (
-            <button
-              key={idx}
-              aria-label={`装備${idx + 1} ${item?.name ?? '空'}`}
-              onClick={() => selectSlot(idx)}
-              className={`relative shrink-0 w-11 h-12 rounded-lg cursor-pointer transition-all flex items-center justify-center ${
-                isActive
-                  ? 'border-2 border-white bg-white/20 shadow-[0_0_12px_rgba(255,255,255,0.4)] scale-110 z-10'
-                  : 'border border-white/10 bg-white/5 hover:bg-white/10'
-              }`}
-            >
-              {/* Number indicator */}
-              <span className="absolute top-0.5 left-1 text-[10px] font-bold text-white/70">{idx + 1}</span>
-
-              {/* Item Graphic */}
-              {texUrl && (
-                <img
-                  src={texUrl}
-                  alt={item?.name}
-                  className="w-8 h-8 object-contain pixelated pointer-events-none drop-shadow"
-                />
-              )}
-
-              {/* Item Count */}
-              {slot.count > 1 && (
-                <span className="absolute bottom-0.5 right-1 text-[11px] font-black text-white drop-shadow-[0_1px_1px_rgba(0,0,0,1)]">
-                  {slot.count}
-                </span>
-              )}
-              {item?.durability && <span className="absolute bottom-1 left-1 right-1 h-1 bg-neutral-700"><span className="block h-full bg-emerald-400" style={{ width: `${100 * (slot.durability ?? item.durability) / item.durability}%` }} /></span>}
-            </button>
-          );
-        })}
-      </div>
+      <SurvivalHud inventory={inventory} activeSlot={activeSlot} health={health} hunger={hunger} oxygen={oxygen}
+        underwater={isUnderwater} creative={gameMode === 'creative'} textures={threeRefs.current?.atlas.dataUrls ?? {}}
+        onSelect={selectSlot} playing={isPlaying} mining={miningView.percent > 0} />
 
       {/* Start / Pause Blocker Screen */}
       {isDead && <div className="absolute inset-0 z-50 bg-black/85 flex items-center justify-center p-4">
@@ -1355,14 +1272,14 @@ export default function App() {
       </div>}
       {!isPlaying && !isDead && !openModal && (
         <div className="absolute inset-0 z-40 bg-black/75 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center">
-          <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto max-w-md w-full bg-neutral-900/90 border border-white/15 p-8 rounded-2xl shadow-2xl space-y-6">
+          <div className="game-panel max-w-md w-full space-y-5">
             <div className="space-y-2">
               <h1 className="text-3xl font-black tracking-wider text-emerald-400">VOXELVERSE</h1>
               <p className="text-xs text-neutral-400 font-mono">3D VOXEL SANDBOX &amp; SURVIVAL</p>
             </div>
 
             <p className="text-sm text-neutral-300 leading-relaxed">
-              資源採掘、ツール制作、クラフト、夜のモンスターとの戦闘、そして自由な建築が楽しめる完全版ボクセルサバイバル環境。
+              資源採掘、ツール制作、クラフト、夜のモンスターとの戦闘、そして自由な建築が楽しめるボクセルサバイバル。
             </p>
 
             <button
@@ -1370,9 +1287,9 @@ export default function App() {
                 beginPlay();
               }}
               disabled={!isReady}
-              className="disabled:opacity-50 disabled:cursor-wait w-full py-3.5 bg-emerald-500 hover:bg-emerald-400 text-black font-black text-sm uppercase tracking-wider rounded-xl transition shadow-lg hover:shadow-emerald-500/30 active:scale-95"
+              className="game-button w-full min-h-12 disabled:opacity-50"
             >
-              {isReady ? 'シミュレーションを開始 / 再開' : 'ワールドを準備中…'}
+              {isReady ? 'ゲームを開始 / 再開' : 'ワールドを準備中…'}
             </button>
 
             <p role="status" className={`text-xs leading-relaxed ${storageError ? 'text-amber-300' : 'text-neutral-400'}`}>
@@ -1382,7 +1299,7 @@ export default function App() {
 
             <button onClick={() => { resetControls(); setTouchEnabled(value => !value); }} className="min-h-11 px-4 rounded-lg border border-white/20 text-sm">タッチ操作: {touchEnabled ? 'ON' : 'OFF'}</button>
             {itemMessage && <p role="status" className="text-xs text-amber-200">{itemMessage}</p>}
-            {touchEnabled && <p className="text-xs text-neutral-300">左スティックで移動、右側をドラッグで視点操作。採掘は長押し。下のホットバーは左右にスワイプできます。</p>}
+            {touchEnabled && <p className="text-xs text-neutral-300">左スティックで移動、右側をドラッグで視点操作。採掘は長押し。下のホットバーをタップして装備を選びます。</p>}
             {/* Quick Controls Cheat Sheet */}
             <div className="text-xs text-neutral-400 grid grid-cols-2 gap-2 text-left bg-black/40 p-4 rounded-xl border border-white/5 font-mono">
               <div><b className="text-white">[ W A S D ]</b> 移動</div>
@@ -1391,6 +1308,7 @@ export default function App() {
               <div><b className="text-white">[ 右クリック ]</b> 配置 / 食べる</div>
               <div><b className="text-white">[ E キー ]</b> インベントリ / クラフト</div>
               <div><b className="text-white">[ 1 - 9 ]</b> スロット選択</div>
+              <div><b className="text-white">[ CTRL ]</b> ダッシュ</div><div><b className="text-white">[ SHIFT ]</b> スニーク / 下降</div>
             </div>
           </div>
         </div>
@@ -1398,10 +1316,10 @@ export default function App() {
 
       {(['inventory', 'workbench', 'furnace', 'chest'] as const).map(mode => openModal === mode && (
         <ItemMenu key={mode} mode={mode} items={items} activeSlot={activeSlot} creative={gameMode === 'creative'} paused
-          chestKey={activeChestKey} onChest={(index, collect) => {
+          chestKey={activeChestKey} onChest={(index, collect, secondary) => {
             if (!activeChestKey) return;
             const before = itemsRef.current;
-            const next = updateItems(state => collect ? collectChestSlot(state, activeChestKey, index) : clickChest(state, activeChestKey, index));
+            const next = updateItems(state => collect ? collectChestSlot(state, activeChestKey, index) : clickChest(state, activeChestKey, index, secondary));
             setItemMessage(next === before ? '空きが足りないため、残りはチェストに保持しています。' : '');
           }}
           furnaceKey={activeFurnaceKey} textures={threeRefs.current?.atlas.dataUrls ?? {}} message={itemMessage}
@@ -1411,30 +1329,15 @@ export default function App() {
 
       {/* Settings & Pause Modal */}
       {openModal === 'settings' && (
-        <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-neutral-900 border border-white/20 p-6 rounded-2xl shadow-2xl max-w-lg w-full space-y-6 max-h-[calc(100dvh-2rem)] overflow-y-auto">
-            <div className="flex justify-between items-center border-b border-white/10 pb-3">
-              <h2 className="text-lg font-bold text-white flex items-center gap-2">
-                <Settings className="w-5 h-5 text-emerald-400" /> ゲーム設定 &amp; ワールド管理
-              </h2>
-              <button
-                onClick={() => {
-                  closeMenu();
-                }}
-                className="text-neutral-400 hover:text-white p-1"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
+        <GameDialog id="settings-title" title="ゲームメニュー / 設定" onClose={closeMenu}>
             <div className="space-y-4">
               {/* Game Mode */}
-              <div className="flex justify-between items-center">
-                <span className="text-sm font-semibold">ゲームモード</span>
-                <div className="flex gap-1 bg-neutral-950 p-1 rounded-lg border border-white/10">
+              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
+                <span className="text-sm font-semibold shrink-0">ゲームモード</span>
+                <div className="flex gap-1 bg-neutral-950 p-1 border border-white/10 w-full sm:w-auto">
                   <button
                     onClick={() => setGameMode('survival')}
-                    className={`px-3 py-1 text-xs rounded-md font-bold transition ${
+                    aria-pressed={gameMode === 'survival'} className={`flex-1 min-h-11 px-2 py-1 text-xs font-bold transition ${
                       gameMode === 'survival' ? 'bg-emerald-500 text-black' : 'text-neutral-400 hover:text-white'
                     }`}
                   >
@@ -1442,7 +1345,7 @@ export default function App() {
                   </button>
                   <button
                     onClick={() => setGameMode('creative')}
-                    className={`px-3 py-1 text-xs rounded-md font-bold transition ${
+                    aria-pressed={gameMode === 'creative'} className={`flex-1 min-h-11 px-2 py-1 text-xs font-bold transition ${
                       gameMode === 'creative' ? 'bg-emerald-500 text-black' : 'text-neutral-400 hover:text-white'
                     }`}
                   >
@@ -1458,7 +1361,7 @@ export default function App() {
                   <span className="font-mono">{fov}°</span>
                 </div>
                 <input
-                  type="range"
+                  aria-label="視野角" type="range"
                   min="60"
                   max="100"
                   value={fov}
@@ -1474,7 +1377,7 @@ export default function App() {
                   <span className="font-mono">{renderDist} チャンク</span>
                 </div>
                 <input
-                  type="range"
+                  aria-label="描画距離" type="range"
                   min="1"
                   max="4"
                   value={renderDist}
@@ -1487,7 +1390,7 @@ export default function App() {
               <div className="flex justify-between items-center pt-2">
                 <span className="text-sm font-semibold">効果音 (SE)</span>
                 <input
-                  type="checkbox"
+                  aria-label="効果音" type="checkbox"
                   checked={soundEnabled}
                   onChange={(e) => setSoundEnabled(e.target.checked)}
                   className="w-4 h-4 accent-emerald-500"
@@ -1497,7 +1400,7 @@ export default function App() {
               <div className="flex justify-between items-center">
                 <span className="text-sm font-semibold">BGM (環境音楽)</span>
                 <input
-                  type="checkbox"
+                  aria-label="BGM" type="checkbox"
                   checked={musicEnabled}
                   onChange={(e) => setMusicEnabled(e.target.checked)}
                   className="w-4 h-4 accent-emerald-500"
@@ -1508,7 +1411,7 @@ export default function App() {
               <div className="flex justify-between items-center">
                 <span className="text-sm font-semibold">平和モード (敵モブなし)</span>
                 <input
-                  type="checkbox"
+                  aria-label="平和モード" type="checkbox"
                   checked={peaceful}
                   onChange={(e) => setPeaceful(e.target.checked)}
                   className="w-4 h-4 accent-emerald-500"
@@ -1565,28 +1468,12 @@ export default function App() {
             >
               設定を閉じてゲームに戻る
             </button>
-          </div>
-        </div>
+        </GameDialog>
       )}
 
       {/* Help & Guide Modal */}
       {openModal === 'help' && (
-        <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-neutral-900 border border-white/20 p-6 rounded-2xl shadow-2xl max-w-lg w-full space-y-5">
-            <div className="flex justify-between items-center border-b border-white/10 pb-3">
-              <h2 className="text-lg font-bold text-white flex items-center gap-2">
-                <HelpCircle className="w-5 h-5 text-emerald-400" /> サバイバル操作ガイド &amp; ヒント
-              </h2>
-              <button
-                onClick={() => {
-                  closeMenu();
-                }}
-                className="text-neutral-400 hover:text-white p-1"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
+        <GameDialog id="help-title" title="遊び方 / 操作ガイド" onClose={closeMenu}>
             <div className="space-y-4 text-xs text-neutral-300 leading-relaxed">
               <div className="bg-neutral-950 p-3.5 rounded-xl border border-white/10 space-y-1.5">
                 <h3 className="font-bold text-emerald-400 text-sm">💡 サバイバルの基本フロー</h3>
@@ -1605,7 +1492,7 @@ export default function App() {
                   <p><b>[ 右クリック ]</b> ブロック配置 / 飲食</p>
                   <p><b>[ E キー ]</b> インベントリ</p>
                   <p><b>[ 1 - 9 ]</b> ホットバー選択</p>
-                  <p><b>[ F キー ]</b> 飛行切替 (クリエイティブ)</p>
+                  <p><b>[ CTRL ]</b> ダッシュ</p><p><b>[ SHIFT ]</b> スニーク / 下降</p><p><b>[ F キー ]</b> 飛行切替 (クリエイティブ)</p><p><b>[ F3 ]</b> 座標を表示</p>
                   <p><b>[ ESC ]</b> ポーズ / 設定</p>
                 </div>
               </div>
@@ -1619,8 +1506,7 @@ export default function App() {
             >
               閉じる
             </button>
-          </div>
-        </div>
+        </GameDialog>
       )}
     </div>
   );

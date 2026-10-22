@@ -1,4 +1,5 @@
-import { useEffect, useRef } from 'react';
+import { useRef, useState } from 'react';
+import { useDialogFocus } from './Dialog';
 import { ITEMS } from './blocks';
 import { CRAFTING_RECIPES, matchRecipe } from './recipes';
 import { emptyFurnace, smeltingRecipe, type FurnaceState } from './furnace';
@@ -8,7 +9,7 @@ import type { InventorySlot } from './types';
 interface Props {
   mode: 'inventory' | 'workbench' | 'furnace' | 'chest';
   chestKey?: string | null;
-  onChest?: (index: number, collect?: boolean) => void;
+  onChest?: (index: number, collect?: boolean, secondary?: boolean) => void;
   items: ItemState;
   activeSlot: number;
   creative: boolean;
@@ -17,11 +18,11 @@ interface Props {
   textures: Record<string, string>;
   message: string;
   onClose: () => void;
-  onInventory: (index: number) => void;
+  onInventory: (index: number, secondary?: boolean, quick?: boolean) => void;
   onCell: (row: number, col: number, size: 2 | 3) => void;
   onCraft: (size: 2 | 3) => void;
   onQuick: (id: string) => void;
-  onFurnace: (kind: 'input' | 'fuel' | 'output') => void;
+  onFurnace: (kind: 'input' | 'fuel' | 'output', secondary?: boolean) => void;
   onReturnCursor: () => void;
 }
 function ItemIcon({ slot, textures }: { slot: InventorySlot; textures: Record<string, string> }) {
@@ -32,12 +33,12 @@ function ItemIcon({ slot, textures }: { slot: InventorySlot; textures: Record<st
     {def?.durability && <span className="absolute bottom-1 left-1 right-1 h-1 bg-neutral-700"><span className="block h-full bg-emerald-400" style={{ width: `${100 * (slot.durability ?? def.durability) / def.durability}%` }} /></span>}
   </>;
 }
-const slotClass = 'relative min-w-11 min-h-11 aspect-square rounded-lg border border-white/20 bg-neutral-950 flex items-center justify-center hover:border-amber-400 focus-visible:outline-2 focus-visible:outline-amber-300';
+const slotClass = 'inventory-slot relative flex items-center justify-center';
 
 export function ItemMenu(p: Props) {
-  const closeRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { closeRef.current?.focus(); }, [p.mode]);
+  useDialogFocus(panelRef, p.onClose);
+  const [single, setSingle] = useState(false);
   const size = p.mode === 'workbench' ? 3 : 2;
   const grid = size === 2 ? p.items.craft2x2 : p.items.craft3x3;
   const result = matchRecipe(grid, size)?.result;
@@ -45,29 +46,25 @@ export function ItemMenu(p: Props) {
   const recipe = smeltingRecipe(furnace.input.itemId);
   const percent = recipe ? Math.min(100, Math.floor(furnace.progress / recipe.cookTime * 100)) : 0;
   const cursor = p.items.cursorItem;
-  return <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-2 sm:p-4">
-    <div ref={panelRef} role="dialog" aria-modal="true" aria-labelledby="item-menu-title"
-      onKeyDown={e => {
-        if (e.key !== 'Tab') return;
-        const controls = Array.from(panelRef.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? []);
-        if (e.shiftKey && document.activeElement === controls[0]) { e.preventDefault(); controls.at(-1)?.focus(); }
-        else if (!e.shiftKey && document.activeElement === controls.at(-1)) { e.preventDefault(); controls[0]?.focus(); }
-      }}
-      className="bg-neutral-900 border border-white/20 p-3 sm:p-5 rounded-2xl shadow-2xl max-w-xl w-full space-y-4 max-h-[calc(100dvh-1rem)] overflow-y-auto overscroll-contain">
+  return <div className="game-overlay">
+    <div ref={panelRef} role="dialog" aria-modal="true" aria-labelledby="item-menu-title" tabIndex={-1}
+      className="game-panel inventory-panel max-w-xl w-full space-y-3">
       <header className="flex items-center justify-between gap-2 border-b border-white/10 pb-2">
-        <h2 id="item-menu-title" className="font-bold">{p.mode === 'chest' ? '📦 チェスト' : p.mode === 'furnace' ? '🔥 かまど' : p.mode === 'workbench' ? '🛠️ 作業台' : '🎒 インベントリ'}</h2>
-        <button ref={closeRef} aria-label="閉じてゲームへ戻る" onClick={p.onClose} className="min-w-11 min-h-11 rounded-lg hover:bg-white/10 text-xl">×</button>
+        <h2 id="item-menu-title" className="font-bold">{p.mode === 'chest' ? 'チェスト' : p.mode === 'furnace' ? 'かまど' : p.mode === 'workbench' ? '作業台' : 'インベントリ'}</h2>
+        <div className="flex items-center gap-2">
+          <button aria-pressed={single} onClick={() => setSingle(value => !value)} className="game-button min-h-11 px-2 text-[11px]">{single ? '1個ずつ: ON' : '1個ずつ'}</button>
+        <button aria-label="閉じてゲームへ戻る" onClick={p.onClose} className="min-w-11 min-h-11 rounded-lg hover:bg-white/10 text-xl">×</button></div>
       </header>
-      <p role="status" className="text-xs text-amber-200 min-h-4">{p.message || '所持品をタップで持ち、別の枠をタップで移動します。'}</p>
-      <div className="flex items-center justify-between gap-2 rounded-lg bg-neutral-950 p-2 text-xs">
+      <p role="status" className="text-[11px] text-amber-200">{p.message || '右クリック: 半分取る・1個置く / Shift: まとめ移動'}</p>
+      {cursor?.itemId && <div className="flex items-center justify-between gap-2 rounded-lg bg-neutral-950 p-2 text-xs">
         <span>{cursor?.itemId ? `持ち運び中: ${ITEMS[cursor.itemId].name} ×${cursor.count}` : '持ち運び中のアイテムなし'}</span>
         <button disabled={!cursor?.itemId} onClick={p.onReturnCursor} className="min-h-11 shrink-0 px-2 rounded-lg bg-neutral-800 disabled:opacity-40">所持品へ戻す</button>
-      </div>
+      </div>}
       {p.mode === 'chest' ? <section aria-label="チェストの中身">
         <p className="text-xs text-neutral-400 mb-2">枠をタップで持ち、所持品やチェストの別枠へ移動します。「回収」は空き分だけ移します。</p>
-        <div className="grid grid-cols-5 min-[380px]:grid-cols-5 min-[380px]:grid-cols-6 sm:grid-cols-9 gap-1.5">
+        <div className="inventory-grid">
           {(p.chestKey ? p.items.chests[p.chestKey] ?? [] : []).map((slot, index) => <div key={index}>
-            <button aria-label={`保管${index + 1} ${slot.itemId ? `${ITEMS[slot.itemId].name} ×${slot.count}` : '空'}`} onClick={() => p.onChest?.(index)} className={`${slotClass} w-full`}><ItemIcon slot={slot} textures={p.textures} /></button>
+            <button aria-label={`保管${index + 1} ${slot.itemId ? `${ITEMS[slot.itemId].name} ×${slot.count}` : '空'}`} onClick={e => p.onChest?.(index, e.shiftKey, single)} onContextMenu={e => { e.preventDefault(); p.onChest?.(index, false, true); }} className={`${slotClass} w-full`}><ItemIcon slot={slot} textures={p.textures} /></button>
             <button disabled={!slot.itemId} aria-label={`保管${index + 1}を所持品へ回収`} onClick={() => p.onChest?.(index, true)} className="w-full min-h-11 text-[10px] disabled:opacity-30">回収</button>
           </div>)}
         </div>
@@ -78,7 +75,7 @@ export function ItemMenu(p: Props) {
           <div className="space-y-2">
             {(['input', 'fuel'] as const).map(kind => <div key={kind} className="text-center">
               <span className="text-xs text-neutral-400">{kind === 'input' ? '材料' : '燃料'}</span>
-              <button aria-label={`${kind === 'input' ? '精錬材料を移す' : '燃料を移す'} ${furnace[kind].itemId ? `${ITEMS[furnace[kind].itemId!].name} ×${furnace[kind].count}` : '空'}`} onClick={() => p.onFurnace(kind)} className={`${slotClass} w-14`}><ItemIcon slot={furnace[kind]} textures={p.textures} /></button>
+              <button aria-label={`${kind === 'input' ? '精錬材料を移す' : '燃料を移す'} ${furnace[kind].itemId ? `${ITEMS[furnace[kind].itemId!].name} ×${furnace[kind].count}` : '空'}`} onClick={() => p.onFurnace(kind, single)} onContextMenu={e => { e.preventDefault(); p.onFurnace(kind, true); }} className={`${slotClass} w-14`}><ItemIcon slot={furnace[kind]} textures={p.textures} /></button>
             </div>)}
           </div>
           <div className="text-center space-y-2 text-xs">
@@ -90,7 +87,7 @@ export function ItemMenu(p: Props) {
         </div>
         <p className="text-xs text-neutral-400">燃料: 石炭28秒・原木7秒・木材3.5秒・棒1.75秒。{recipe ? `1個の精錬に${recipe.cookTime}秒。` : '鉄・金鉱石、砂、丸石、生肉を精錬できます。'}</p>
       </> : <>
-        <p className="text-xs text-neutral-400">材料枠には1個ずつ配置。完成品が入らない場合、材料は消費しません。</p>
+        <p className="hidden sm:block text-xs text-neutral-400">材料枠には1個ずつ配置。完成品が入らない場合、材料は消費しません。</p>
         <div className="flex items-center justify-around gap-3 rounded-xl bg-neutral-950 p-3">
           <div className={`grid gap-1.5 ${size === 2 ? 'grid-cols-2' : 'grid-cols-3'}`}>
             {grid.map((row, r) => row.map((id, c) => <button key={`${r},${c}`} aria-label={`材料 ${r + 1}行${c + 1}列${id ? ` ${ITEMS[id].name}` : ' 空'}`} onClick={() => p.onCell(r, c, size)} className={`${slotClass} w-11 sm:w-12`}><ItemIcon slot={{ itemId: id, count: id ? 1 : 0 }} textures={p.textures} /></button>))}
@@ -98,7 +95,8 @@ export function ItemMenu(p: Props) {
           <span aria-hidden="true">→</span>
           <button aria-label={`クラフトの完成品を作る ${result ? `${ITEMS[result.itemId].name} ×${result.count}` : '空'}`} disabled={!result} onClick={() => p.onCraft(size)} className={`${slotClass} w-14 border-emerald-400/50 disabled:opacity-40`}><ItemIcon slot={result ? { ...result } : { itemId: null, count: 0 }} textures={p.textures} /></button>
         </div>
-        <section aria-label="レシピ一覧">
+        <details className="recipe-book" aria-label="レシピ一覧">
+          <summary className="cursor-pointer min-h-8 flex items-center">レシピブック</summary>
           <h3 className="text-xs text-neutral-400 mb-2">レシピから制作{p.creative ? '（クリエイティブ: 材料不要）' : '（材料を消費）'}</h3>
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-44 overflow-y-auto">
             {CRAFTING_RECIPES.filter(r => r.gridSize <= size).map(rec => {
@@ -110,15 +108,16 @@ export function ItemMenu(p: Props) {
               </button>;
             })}
           </div>
-        </section>
+        </details>
       </>}
       <section aria-label="所持品">
-        <h3 className="text-xs text-neutral-400 mb-2">所持品（1〜9はゲーム画面のホットバー）</h3>
-        <div className="grid grid-cols-5 min-[380px]:grid-cols-6 sm:grid-cols-9 gap-1.5">
-          {p.items.inventory.map((slot, index) => {
+        <h3 className="text-xs text-neutral-400 mb-2">所持品 / ホットバー</h3>
+        <div className="inventory-grid">
+          {[...Array.from({ length: 27 }, (_, i) => i + 9), ...Array.from({ length: 9 }, (_, i) => i)].map(index => {
+            const slot = p.items.inventory[index];
             const def = slot.itemId ? ITEMS[slot.itemId] : null;
             const label = `所持品${index + 1} ${def ? `${def.name} ×${slot.count}${def.durability ? ` 耐久${slot.durability ?? def.durability}/${def.durability}` : ''}` : '空'}`;
-            return <button key={index} aria-label={label} title={label} onClick={() => p.onInventory(index)} className={`${slotClass} ${index === p.activeSlot ? 'border-amber-400 ring-1 ring-amber-400' : ''}`}>
+            return <button key={index} aria-label={label} title={label} onClick={e => p.onInventory(index, single, e.shiftKey)} onContextMenu={e => { e.preventDefault(); p.onInventory(index, true); }} className={`${slotClass} ${index < 9 ? 'inventory-hotbar-slot' : ''}`}>
               {index < 9 && <span className="absolute top-0 left-1 text-[9px] text-neutral-400">{index + 1}</span>}
               <ItemIcon slot={slot} textures={p.textures} />
             </button>;

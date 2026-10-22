@@ -25,6 +25,7 @@ interface Props {
   onMine: (held: boolean) => void;
   onJump: (held: boolean) => void;
   onSprint: (held: boolean) => void;
+  onSneak?: (held: boolean) => void;
   onUse: () => void;
   onMenu: () => void;
   onPause: () => void;
@@ -63,8 +64,9 @@ export function TouchControls(p: Props) {
     <div className="absolute right-[max(1rem,env(safe-area-inset-right))] bottom-[calc(6.5rem+env(safe-area-inset-bottom))] grid grid-cols-2 gap-2 pointer-events-auto">
       <HoldButton label="採掘 / 攻撃" onHold={p.onMine} />
       <button onClick={p.onUse} className="min-w-14 min-h-14 rounded-xl border border-white/30 bg-neutral-900/75 text-sm font-bold touch-manipulation">置く / 使う</button>
-      <HoldButton label="走る / 下降" onHold={p.onSprint} />
+      <HoldButton label="ダッシュ" onHold={p.onSprint} />
       <HoldButton label="ジャンプ" onHold={p.onJump} />
+      {p.onSneak && <HoldButton label="スニーク / 下降" onHold={p.onSneak} />}
     </div>
     <div className="absolute top-[max(1rem,env(safe-area-inset-top))] left-4 flex gap-2 pointer-events-auto">
       <button onClick={p.onMenu} className="min-h-11 px-3 rounded-lg bg-neutral-900/80 border border-white/30 text-xs">持ち物</button>

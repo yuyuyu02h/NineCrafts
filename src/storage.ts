@@ -4,10 +4,10 @@ const DB_NAME = 'ninecrafts';
 const STORE = 'worlds';
 const SAVE_KEY = 'active';
 
-function openDatabase(): Promise<IDBDatabase> {
+function openDatabase(databaseName = DB_NAME): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     if (typeof indexedDB === 'undefined') { reject(new Error('このブラウザでは保存機能を利用できません。')); return; }
-    const request = indexedDB.open(DB_NAME, 1);
+    const request = indexedDB.open(databaseName, 1);
     let blocked = false;
     request.onupgradeneeded = () => { request.result.createObjectStore(STORE); };
     request.onerror = () => reject(new Error('保存領域を開けません。ブラウザの設定や空き容量を確認してください。'));
@@ -30,8 +30,8 @@ function readRecord(db: IDBDatabase): Promise<unknown> {
   });
 }
 
-export async function loadGame(): Promise<GameSave | null> {
-  const db = await openDatabase();
+export async function loadGame(databaseName = DB_NAME): Promise<GameSave | null> {
+  const db = await openDatabase(databaseName);
   try {
     const record = await readRecord(db);
     if (record === undefined) return null;
@@ -41,9 +41,9 @@ export async function loadGame(): Promise<GameSave | null> {
   } finally { db.close(); }
 }
 
-export async function saveGame(save: GameSave, expectedSavedAt: number | null): Promise<void> {
+export async function saveGame(save: GameSave, expectedSavedAt: number | null, databaseName = DB_NAME): Promise<void> {
   const validated = parseSave(save);
-  const db = await openDatabase();
+  const db = await openDatabase(databaseName);
   try {
     await new Promise<void>((resolve, reject) => {
       const transaction = db.transaction(STORE, 'readwrite');
@@ -74,3 +74,6 @@ export async function saveGame(save: GameSave, expectedSavedAt: number | null): 
     });
   } finally { db.close(); }
 }
+
+export const gameStorage = { load: () => loadGame(), save: (data: GameSave, expected: number | null) => saveGame(data, expected) };
+export type GameStorage = typeof gameStorage;
