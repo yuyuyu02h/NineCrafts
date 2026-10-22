@@ -144,6 +144,8 @@ When requirements conflict, identify the conflict instead of silently choosing o
 
 - 日本語で結論から簡潔に報告する。
 - 実装状況はTODO.md、判断はdocs/DECISIONS.md、再開情報はdocs/HANDOFF.mdへ記録する。
+- 不具合・改善要望を受けたら、「認識だけ」「今回は直さない」という依頼でも、そのターン中にTODO.mdへ記録する。会話上の了承だけで完了にしない。
+- 記録には報告内容・発生手順・期待する挙動・確認状況・対応状態を残し、ユーザー報告と確認済みの事実を区別する。修正不要の指定がある場合は記録だけ行い、実装へ進まない。完了報告では記録先のリンクを示す。
 - REVIEW.mdは監査時点の記録として保持する。
 - React + Vite + Three.js。Next.jsへ移行しない。
 - 進行データを扱う処理は破損・拒否・旧版・数量保存を検証する。

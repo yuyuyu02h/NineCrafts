@@ -11,7 +11,7 @@ PC 60fps／ミドルレンジスマホ30fps以上、約60分のカジュアル�
 - React 19 / TypeScript / Vite 8 / Three.js r170 / Tailwind CSS 4。Next.jsではない。
 - ブラウザ内で完結するSPA。稼働中のバックエンド・認証・ランキングなし。
 - 描画: Three.js、手続き生成テクスチャ、Web Audio合成。
-- ホスティング先・本番運用環境は未確認。依存追加・外部サービス導入を前提にしない。
+- 本番: Cloudflare Pages（ninecrafts）。https://ninecrafts.pages.dev/ 。GitHub mainのPushで自動デプロイ。依存追加なし。公開設定・検証記録はdocs/DEPLOYMENT.md。
 
 ## 作業方針
 
