@@ -5,7 +5,11 @@
 - src/main.tsx: SPAエントリ。SSR・Routerなし。
 - src/App.tsx: HUD・設定・入力・ゲームループ・プレイヤー物理・各機能の接続。
 - src/items.ts / useItems.ts: 所持品・カーソル・材料・かまどの原子的な操作と最新参照。更新は同期的に一度だけ実行し、React表示はその写し。
-- src/ItemMenu.tsx: インベントリ・作業台・精錬の表示、フォーカス制御。
+- src/ItemMenu.tsx: インベントリ・作業台・精錬・チェストの表示。半分取得／1個配置／Shift移動の操作をitems.tsへ接続。
+- src/SurvivalHud.tsx: ピクセルの体力・空腹・酸素、9枠ホットバー、手持ち表示。
+- src/Dialog.tsx: 所持品・設定・ヘルプの共通フォーカス、Tab循環とEscape。死亡・エラー画面への共通化は未完了。
+- src/playerMotion.ts: 歩行速度、細分化した衝突・接触補正、スニーク時の縁の保護。
+- src/environmentSettings.ts: 描画距離別の霧と雲の初期行列。src/lifecycle.ts: 初期化途中を含む資源解放。
 - src/TouchControls.tsx: ポインターID別の移動・視点・長押し。src/mining.ts: 適正道具・必要ランク・所要秒。
 - src/furnace.ts: 入力・燃料・出力・経過秒の純粋な精錬処理。
 - src/world.ts: チャンク生成・ブロック・InstancedMesh・水・爆発。
@@ -16,7 +20,7 @@
 ## データフロー
 
 入力 → Three.js/ref内のゲーム状態更新 → 必要なHUDをReactへ通知 → 描画。
-現在はReact stateとrefの混在、古いクロージャ、別時計がある。各段階で必要な箇所から整理する。
+GameSessionとitemsRefをゲーム状態の正とし、物理・設備・戦闘は共通の60Hz固定ステップで更新する。React stateは表示用の写しで、HUDへ10Hzで通知する。残るAppの分割・毎更新の割り当ては、実測と変更範囲に応じて整理する。
 
 ## P01で追加した保存経路
 
@@ -56,10 +60,10 @@
 
 src/mouseInput.tsはcanvasのmousedownとwindowのmouseup／pointercancel／blurを接続する。PointerLockControlsとrequestPointerLockも同じcanvasを対象にする。bodyへ固定してcanvas限定の入力を待つ構成は使用しない。UI・ポーズ中のクリックはゲーム動作へ流さない。タッチ側は個別PointerEventのまま。
 
-## P06〜P09（ローカル実装）
+## P06〜P09（実装・公開済み）
 
 - src/simulation.ts: FixedStepper（60Hz、停止中の時間を蓄積しない）とGameSession（playing／paused／dead、HP・空腹・酸素・攻撃／被弾間隔）。Reactは表示用の写し。HUD通知は10Hz。
-- Appで全メニュー・blur・visibilitychange・ロック解除・死亡に入力／速度解除を適用。死亡時の実時間タイマーは廃止。復活ボタンからfindSafeSpawn→resetPlayerViewで乾いた足場・視点水平・速度0・酸素10へ戻す。
+- Appで全メニュー・blur・visibilitychange・ロック解除・死亡に入力解除を適用。現行ではポーズ中の速度・落下距離は保持し、復活時に初期化する。死亡時の実時間タイマーは廃止。復活ボタンからfindSafeSpawn→resetPlayerViewで乾いた足場・視点水平・速度0・酸素10へ戻す。
 - src/combat.ts: 身体のBox3と水平距離＋高さの近接判定。モブ・プレイヤー・矢で体積を使い、矢は移動線分に沿って壁と最初の対象を調べる。敵と動物は各12枠、夜は2秒・動物は5秒ごとに候補を探す。モブは48ブロック超で休止、80超で退去。
 - ItemState.chests[座標]が27枠を持つ。クリック・回収とも原子的に数量を移す。かまどとチェストは撤去通知で中身をドロップし、アンロード時は中身を維持。
 - 保存v3: chests／legacyChest、primedTnt、world.waterLevelsを追加。v1／v2を保護して移行。流れの横距離を保存し、再読み込みで全水セルが水源になることを防ぐ。
@@ -67,3 +71,16 @@ src/mouseInput.tsはcanvasのmousedownとwindowのmouseup／pointercancel／blur
 - 水: 自然生成水は休止。キューは座標重複排除・2,048件、0.35秒に16セル、横距離3、流れ追加はwaterLevels計4,096セルを目安に停止。配置した水源と編集履歴は消去しない。
 - 爆発は編集を一括反映し、描画行列を1回更新。GPUへは使用中の行列範囲だけ送る。トーチ光源は24ブロック内で近い8個、破片180個、矢128本を上限にする。
 - src/resources.ts: 共有geometry／materialを重複なくdispose。個体削除では共通アトラスを壊さず、ページ終了時はworld／mobs／環境／テクスチャも解放する。
+
+## 2026-10-22の追加実装
+
+- キーボードのダッシュはRトグル。Ctrlは使用しない。リピート・修飾キー付きRでは変更しない。タッチのダッシュは長押し方式を維持する。
+- GameSession.survivalで移動・時間による空腹、自然回復と空腹ダメージを進行中だけ更新。R切替はmoveStateに保持し、ポーズ時の入力解除でOFFになる。
+- movePlayerは最大移動量0.25セルで細分化し、接触・縁を二分探索して移動を補正する。視点の上下に影響されないyaw基準の移動を使い、移動ベクトルの毎回生成を減らした。
+- VoxelWorld.isChunkLoadedをドロップ更新前に確認し、未読込中の位置・速度・寿命を保つ。未生成領域を空気扱いして落下させない。
+- 起動は段階別のCleanupScopeで後始末を登録。失敗時は画面へ理由と再試行を表示。context lost通知後はメモリ内スナップショットを新Canvas・新シーンへ復元する。これは永続バックアップ復旧UIとは別物。
+- 通常時の霧はviewFog(renderDistance)。水中は水中用の霧。雲は全行列を初期アップロードし、アニメーションはレイヤー単位で移動する。
+- BGMのmusicEnabled setterがタイマー・音源の停止と再予約を管理する。
+- Appのstorage依存を差し替え可能にし、本体のIndexedDBと分離した検証DB／メモリ内プレビューを使用する。通常buildの入口は引き続きindex.htmlのみで、検証HTMLは公開buildへ含めない。
+
+保存形式はv3のまま。新規依存・バックエンド追加なし。実装と検証対象コミットの区別はdocs/VALIDATION-LATEST.mdを参照。
