@@ -66,3 +66,17 @@
 - 開始時のGitHub mainとローカルHEADは5a8cd37590ce257823ed4f51fa314857308b2081で一致。
 - 公開前検証: テスト48件、型チェック、Vite build成功。JS index-BvbfNFwb.js（868.22kB、gzip236.70kB）。詳細はVALIDATION-P06-P09.md。
 - mainへの通常Pushで既存Pagesの自動デプロイを実行し、完了後にコミット・デプロイID・公開表示を追記する。
+
+## 公開結果 — 2026-10-22（P06〜P09）
+
+- 本番URL: https://ninecrafts.pages.dev/
+- 実装コミット: 2e8b798d7652ee390e2edbde301dd1732d145243（main）。通常Push成功。
+- デプロイID: cc8814c7-e61e-4a2c-b1fd-c5fb1079add1
+- 固定URL: https://cc8814c7.ninecrafts.pages.dev/
+- CloudflareのProduction詳細でstatus success、所要22秒、ビルド・公開成功ログを確認。
+- Node22.16.0／Bun1.4.2、凍結ロックファイルによる依存導入。JS index-BvbfNFwb.js／CSS index-BtLzwDa1.cssはローカル成果物と一致。500kB超の既存警告あり。
+- 本番URLで開始画面と背後の地形表示を確認。DOMのscriptが最新版index-BvbfNFwb.jsであることを確認。確認時エラーログ0件。
+- 公開上では既存セーブを更新しないため開始・採掘・設置・死亡再現は行わず、今回の操作検証はローカルの記録を参照する。実機FPS・物理タッチ・長時間検証は未実施。
+- 公開作業時の再検証でもnpm test48件／npm run lint成功。
+- 公開確認画像はローカルのみ保持。既存セーブ表示を含むため、画像Pushは自動承認審査により拒否され、GitHubへは送信していない。
+- この公開結果の管理MDも追補コミットでmainへPushする。追補はゲームソース変更なし。
