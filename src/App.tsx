@@ -811,7 +811,7 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!persistenceRef.current.initialized || sessionRef.current.phase === 'dead') return;
-      if (e.repeat && ['KeyE', 'KeyF', 'F3', 'Escape'].includes(e.code)) return;
+      if (e.repeat && ['KeyE', 'KeyF', 'KeyR', 'F3', 'Escape'].includes(e.code)) return;
       if (e.code === 'F3') { e.preventDefault(); setShowDebug(value => !value); return; }
       // Toggle inventory with 'E'
       if (e.code === 'KeyE') {
@@ -838,7 +838,7 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
       if (!refs || !playingRef.current || openModalRef.current) return;
 
       const { moveState, player } = refs;
-      if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight'].includes(e.code)) e.preventDefault();
+      if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'ShiftLeft', 'ShiftRight'].includes(e.code)) e.preventDefault();
       switch (e.code) {
         case 'KeyW':
           moveState.forward = true;
@@ -852,9 +852,9 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
         case 'KeyD':
           moveState.right = true;
           break;
-        case 'ControlLeft':
-        case 'ControlRight':
-          e.preventDefault(); moveState.sprint = true;
+        case 'KeyR':
+          if (e.ctrlKey || e.metaKey || e.altKey) return;
+          e.preventDefault(); moveState.sprint = !moveState.sprint;
           break;
         case 'ShiftLeft':
         case 'ShiftRight':
@@ -902,10 +902,6 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
           break;
         case 'KeyD':
           moveState.right = false;
-          break;
-        case 'ControlLeft':
-        case 'ControlRight':
-          moveState.sprint = false;
           break;
         case 'ShiftLeft':
         case 'ShiftRight':
@@ -1308,7 +1304,7 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
               <div><b className="text-white">[ 右クリック ]</b> 配置 / 食べる</div>
               <div><b className="text-white">[ E キー ]</b> インベントリ / クラフト</div>
               <div><b className="text-white">[ 1 - 9 ]</b> スロット選択</div>
-              <div><b className="text-white">[ CTRL ]</b> ダッシュ</div><div><b className="text-white">[ SHIFT ]</b> スニーク / 下降</div>
+              <div><b className="text-white">[ R ]</b> ダッシュ切り替え</div><div><b className="text-white">[ SHIFT ]</b> スニーク / 下降</div>
             </div>
           </div>
         </div>
@@ -1492,7 +1488,7 @@ export default function App({ storage = gameStorage }: { storage?: GameStorage }
                   <p><b>[ 右クリック ]</b> ブロック配置 / 飲食</p>
                   <p><b>[ E キー ]</b> インベントリ</p>
                   <p><b>[ 1 - 9 ]</b> ホットバー選択</p>
-                  <p><b>[ CTRL ]</b> ダッシュ</p><p><b>[ SHIFT ]</b> スニーク / 下降</p><p><b>[ F キー ]</b> 飛行切替 (クリエイティブ)</p><p><b>[ F3 ]</b> 座標を表示</p>
+                  <p><b>[ R ]</b> ダッシュON／OFF</p><p><b>[ SHIFT ]</b> スニーク / 下降</p><p><b>[ F キー ]</b> 飛行切替 (クリエイティブ)</p><p><b>[ F3 ]</b> 座標を表示</p>
                   <p><b>[ ESC ]</b> ポーズ / 設定</p>
                 </div>
               </div>
