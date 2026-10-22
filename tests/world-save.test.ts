@@ -4,20 +4,7 @@ import * as THREE from 'three';
 import { VoxelWorld } from '../src/world';
 import { BLOCKS } from '../src/blocks';
 
-// Exercise actual generation/edit/restore code, without creating a WebGL renderer or 25 GPU buffers.
-function world(seed: number): VoxelWorld {
-  const value = Object.create(VoxelWorld.prototype) as VoxelWorld;
-  Object.assign(value, {
-    seed, generating: false, blockEdits: new Map(), worldData: new Map(), chunkData: new Map(),
-    generatedChunks: new Set(), chunkRenderData: new Map(), dirtyChunks: new Set(),
-    pendingWaterFlow: [], waterFlowTimer: 0, torchLights: new Map(), debrisList: [],
-    lastPlayerPos: new THREE.Vector3(), lastPlayerChunkX: null, lastPlayerChunkZ: null,
-    scene: new THREE.Scene(), renderDistance: 1, instancedMeshes: {},
-    targetBoxMesh: new THREE.LineSegments(), crackMesh: new THREE.Mesh(),
-  });
-  value.updateInstancedMeshes = () => {};
-  return value;
-}
+import { world } from './world-fixture';
 const cells = (value: VoxelWorld) => Array.from(value.worldData).sort(([a], [b]) => a.localeCompare(b));
 
 test('seeded terrain and cross-border trees are independent of chunk visit order', () => {
@@ -55,7 +42,7 @@ test('mined negative-coordinate cells and placed blocks survive reload and regen
   restored.generateChunk(0, 0); restored.generateChunk(-1, 0);
   assert.equal(restored.getBlock(-1, groundY, 0), null);
   assert.equal(restored.getBlock(-1, 40, 0), BLOCKS.BRICK);
-  assert.equal(restored.torchLights.size, 1);
+  assert.equal(restored.torchPositions.size, 1);
   assert.deepEqual(cells(restored), cells(original));
 });
 

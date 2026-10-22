@@ -10,12 +10,14 @@ export interface ItemState {
   craft3x3: (string | null)[][];
   furnaces: Record<string, FurnaceState>;
   legacyFurnace: FurnaceState | null;
+  chests: Record<string, InventorySlot[]>;
+  legacyChest: InventorySlot[] | null;
 }
 export const emptyGrid = (size: number): (string | null)[][] => Array.from({ length: size }, () => Array(size).fill(null));
 export function initialItems(): ItemState {
   const inventory = Array.from({ length: 36 }, emptySlot);
   inventory.splice(0, 5, stack('wood', 16), stack('planks', 32), stack('water_bucket', 1), stack('torch', 16), stack('apple', 8));
-  return { inventory, cursorItem: null, craft2x2: emptyGrid(2), craft3x3: emptyGrid(3), furnaces: {}, legacyFurnace: null };
+  return { inventory, cursorItem: null, craft2x2: emptyGrid(2), craft3x3: emptyGrid(3), furnaces: {}, legacyFurnace: null, chests: {}, legacyChest: null };
 }
 export function stack(itemId: string, count: number, durability?: number): InventorySlot {
   const max = ITEMS[itemId]?.durability;
@@ -166,4 +168,24 @@ export function wearTool(inventory: InventorySlot[], index: number): InventorySl
   const next = inventory.slice();
   next[index] = durability > 0 ? { ...slot, durability } : emptySlot();
   return next;
+}
+
+export function ensureChest(state: ItemState, key: string): ItemState {
+  if (Object.hasOwn(state.chests, key)) return state;
+  return { ...state, chests: { ...state.chests, [key]: state.legacyChest ?? Array.from({ length: 27 }, emptySlot) }, legacyChest: null };
+}
+export function clickChest(state: ItemState, key: string, index: number): ItemState {
+  const slots = state.chests[key];
+  if (!slots || !slots[index]) return state;
+  const container = { ...state, inventory: slots };
+  const moved = clickInventory(container, index);
+  return moved === container ? state : { ...state, cursorItem: moved.cursorItem, chests: { ...state.chests, [key]: moved.inventory } };
+}
+export function collectChestSlot(state: ItemState, key: string, index: number): ItemState {
+  const slot = state.chests[key]?.[index];
+  if (!slot?.itemId) return state;
+  const result = insertStack(state.inventory, slot);
+  if (!result.accepted) return state;
+  const slots = state.chests[key].slice(); slots[index] = consumeSlot(slot, result.accepted);
+  return { ...state, inventory: result.inventory, chests: { ...state.chests, [key]: slots } };
 }

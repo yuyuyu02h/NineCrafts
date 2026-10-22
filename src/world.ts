@@ -5,10 +5,17 @@ import { DebrisParticle, TorchLight } from './types';
 import { sound } from './audio';
 import { worldRandom } from './worldSeed';
 import type { WorldSave } from './save';
+import { disposeObjects } from './resources';
 
 export const CHUNK_SIZE = 16;
 export const MAX_INSTANCES_PER_BLOCK = 40000;
 export const BEDROCK_Y = -14;
+export const MAX_WATER_QUEUE = 2048;
+export const MAX_FLOWING_WATER = 4096;
+export const MAX_TORCH_LIGHTS = 8;
+export const MAX_DEBRIS = 180;
+export interface PrimedTnt { x: number; y: number; z: number; remaining: number }
+
 
 export class VoxelWorld {
   public scene: THREE.Scene;
@@ -38,6 +45,14 @@ export class VoxelWorld {
   // Water fluid simulation queue
   public pendingWaterFlow: Array<{ x: number; y: number; z: number; spread: number }> = [];
   private waterFlowTimer = 0;
+  private waterQueued = new Set<string>();
+  public waterLevels = new Map<string, number>();
+  public primedTnt: PrimedTnt[] = [];
+  public torchPositions = new Map<string, THREE.Vector3>();
+  private editsByChunk = new Map<string, Map<string, BlockId>>();
+  private lastRenderDistance = -1;
+  private lastLightPos = new THREE.Vector3(Infinity, Infinity, Infinity);
+
 
   public seed: number;
   public blockEdits = new Map<string, BlockId>();
@@ -59,6 +74,7 @@ export class VoxelWorld {
     );
     this.targetBoxMesh.visible = false;
     this.scene.add(this.targetBoxMesh);
+    boxGeo.dispose();
 
     // Crack overlay mesh
     const crackGeo = new THREE.BoxGeometry(1.004, 1.004, 1.004);
@@ -497,7 +513,7 @@ export class VoxelWorld {
         }
       }
     } finally { this.generating = false; }
-    for (const [key, type] of this.blockEdits) {
+    for (const [key, type] of this.editsByChunk.get(cKey) ?? []) {
       if (type === BLOCKS.AIR) continue;
       const [x, y, z] = key.split(',').map(Number);
       if (Math.floor(x / CHUNK_SIZE) === cx && Math.floor(z / CHUNK_SIZE) === cz) {
@@ -529,20 +545,37 @@ export class VoxelWorld {
   }
 
   public updateChunks(playerPos: THREE.Vector3) {
-    const pCx = Math.floor(playerPos.x / CHUNK_SIZE);
-    const pCz = Math.floor(playerPos.z / CHUNK_SIZE);
-
-    if (pCx === this.lastPlayerChunkX && pCz === this.lastPlayerChunkZ) return;
-
-    for (let cx = pCx - this.renderDistance; cx <= pCx + this.renderDistance; cx++) {
-      for (let cz = pCz - this.renderDistance; cz <= pCz + this.renderDistance; cz++) {
-        this.generateChunk(cx, cz);
-      }
+    this.lastPlayerPos.copy(playerPos);
+    const pCx = Math.floor(playerPos.x / CHUNK_SIZE), pCz = Math.floor(playerPos.z / CHUNK_SIZE);
+    if (pCx === this.lastPlayerChunkX && pCz === this.lastPlayerChunkZ && this.lastRenderDistance === this.renderDistance) {
+      if (this.lastLightPos.distanceToSquared(playerPos) >= 4) this.syncTorchLights();
+      return;
     }
-
-    this.lastPlayerChunkX = pCx;
-    this.lastPlayerChunkZ = pCz;
+    const keep = this.renderDistance + 1;
+    for (const key of [...this.generatedChunks]) {
+      const [cx, cz] = key.split(',').map(Number);
+      if (Math.abs(cx - pCx) <= keep && Math.abs(cz - pCz) <= keep) continue;
+      for (const b of this.chunkData.get(key) ?? []) {
+        const cell = this.getKey(b.x, b.y, b.z);
+        this.worldData.delete(cell); this.torchPositions.delete(cell);
+        if (b.type === BLOCKS.TORCH) this.removeTorchLight(b.x, b.y, b.z);
+      }
+      this.chunkData.delete(key); this.chunkRenderData.delete(key); this.generatedChunks.delete(key); this.dirtyChunks.delete(key);
+    }
+    this.pendingWaterFlow = this.pendingWaterFlow.filter(w => this.generatedChunks.has(this.getChunkKey(Math.floor(w.x / 16), Math.floor(w.z / 16))));
+    this.waterQueued = new Set(this.pendingWaterFlow.map(w => this.getKey(w.x, w.y, w.z)));
+    // One extra resident ring prevents water/AI reading unknown cells at the visible edge.
+    for (let cx = pCx - keep; cx <= pCx + keep; cx++) for (let cz = pCz - keep; cz <= pCz + keep; cz++) this.generateChunk(cx, cz);
+    for (const key of this.dirtyChunks) if (!this.generatedChunks.has(key)) this.dirtyChunks.delete(key);
+    this.lastPlayerChunkX = pCx; this.lastPlayerChunkZ = pCz; this.lastRenderDistance = this.renderDistance;
     this.updateInstancedMeshes(playerPos);
+  }
+
+  private recordEdit(key: string, type: BlockId, cx: number, cz: number) {
+    this.blockEdits.set(key, type);
+    const chunk = this.getChunkKey(cx, cz);
+    if (!this.editsByChunk.has(chunk)) this.editsByChunk.set(chunk, new Map());
+    this.editsByChunk.get(chunk)!.set(key, type);
   }
 
   public addBlock(x: number, y: number, z: number, type: BlockId, updateMesh = true) {
@@ -554,7 +587,7 @@ export class VoxelWorld {
     if (this.worldData.has(key) || (this.generating && this.blockEdits.has(key))) return;
 
     this.worldData.set(key, type);
-    if (!this.generating) this.blockEdits.set(key, type);
+    if (!this.generating) this.recordEdit(key, type, Math.floor(bx / CHUNK_SIZE), Math.floor(bz / CHUNK_SIZE));
 
     const cx = Math.floor(bx / CHUNK_SIZE);
     const cz = Math.floor(bz / CHUNK_SIZE);
@@ -567,12 +600,13 @@ export class VoxelWorld {
 
     this.markChunkDirty(cx, cz);
     if (bx % CHUNK_SIZE === 0) this.markChunkDirty(cx - 1, cz);
-    if (bx % CHUNK_SIZE === CHUNK_SIZE - 1) this.markChunkDirty(cx + 1, cz);
+    if (((bx % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE === CHUNK_SIZE - 1) this.markChunkDirty(cx + 1, cz);
     if (bz % CHUNK_SIZE === 0) this.markChunkDirty(cx, cz - 1);
-    if (bz % CHUNK_SIZE === CHUNK_SIZE - 1) this.markChunkDirty(cx, cz + 1);
+    if (((bz % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE === CHUNK_SIZE - 1) this.markChunkDirty(cx, cz + 1);
 
     // Handle Torch light
     if (type === BLOCKS.TORCH) {
+      this.torchPositions.set(key, new THREE.Vector3(bx, by, bz));
       this.addTorchLight(bx, by, bz);
     }
 
@@ -581,12 +615,14 @@ export class VoxelWorld {
     }
 
     // If water was placed, queue physical water flow
-    if (type === BLOCKS.WATER) {
-      this.pendingWaterFlow.push({ x: bx, y: by, z: bz, spread: 0 });
+    if (type === BLOCKS.WATER && !this.generating) {
+      const spread = this.waterLevels.get(key) ?? 0;
+      this.waterLevels.set(key, spread);
+      this.queueWater(bx, by, bz, spread);
     }
   }
 
-  public removeBlock(x: number, y: number, z: number, spawnParticles = true): BlockId | null {
+  public removeBlock(x: number, y: number, z: number, spawnParticles = true, updateMesh = true): BlockId | null {
     const bx = Math.floor(x);
     const by = Math.floor(y);
     const bz = Math.floor(z);
@@ -598,7 +634,9 @@ export class VoxelWorld {
     if (type === BLOCKS.BEDROCK) return null; // Unbreakable
 
     this.worldData.delete(key);
-    this.blockEdits.set(key, BLOCKS.AIR);
+    this.recordEdit(key, BLOCKS.AIR, Math.floor(bx / CHUNK_SIZE), Math.floor(bz / CHUNK_SIZE));
+    this.waterLevels.delete(key);
+    this.torchPositions.delete(key);
     this.onBlockRemoved?.(bx, by, bz, type);
 
     const cx = Math.floor(bx / CHUNK_SIZE);
@@ -613,9 +651,9 @@ export class VoxelWorld {
 
     this.markChunkDirty(cx, cz);
     if (bx % CHUNK_SIZE === 0) this.markChunkDirty(cx - 1, cz);
-    if (bx % CHUNK_SIZE === CHUNK_SIZE - 1) this.markChunkDirty(cx + 1, cz);
+    if (((bx % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE === CHUNK_SIZE - 1) this.markChunkDirty(cx + 1, cz);
     if (bz % CHUNK_SIZE === 0) this.markChunkDirty(cx, cz - 1);
-    if (bz % CHUNK_SIZE === CHUNK_SIZE - 1) this.markChunkDirty(cx, cz + 1);
+    if (((bz % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE === CHUNK_SIZE - 1) this.markChunkDirty(cx, cz + 1);
 
     if (type === BLOCKS.TORCH) {
       this.removeTorchLight(bx, by, bz);
@@ -635,11 +673,11 @@ export class VoxelWorld {
     ];
     for (const [nx, ny, nz] of waterNeighbors) {
       if (this.getBlock(nx, ny, nz) === BLOCKS.WATER) {
-        this.pendingWaterFlow.push({ x: nx, y: ny, z: nz, spread: 0 });
+        this.queueWater(nx, ny, nz, this.waterLevels.get(this.getKey(nx, ny, nz)) ?? 0);
       }
     }
 
-    this.updateInstancedMeshes(this.lastPlayerPos);
+    if (updateMesh) this.updateInstancedMeshes(this.lastPlayerPos);
     return type;
   }
 
@@ -649,7 +687,7 @@ export class VoxelWorld {
 
   private addTorchLight(x: number, y: number, z: number) {
     const key = this.getKey(x, y, z);
-    if (this.torchLights.has(key)) return;
+    if (this.torchLights.has(key) || this.torchLights.size >= MAX_TORCH_LIGHTS || this.lastPlayerPos.distanceToSquared(new THREE.Vector3(x, y, z)) > 24 * 24) return;
 
     const pLight = new THREE.PointLight(0xffb84d, 1.8, 14);
     pLight.position.set(x + 0.5, y + 0.6, z + 0.5);
@@ -667,59 +705,53 @@ export class VoxelWorld {
     }
   }
 
-  // Physical water cellular automata fluid simulation
+  public syncTorchLights() {
+    this.lastLightPos.copy(this.lastPlayerPos);
+    const nearest = [...this.torchPositions].filter(([, p]) => p.distanceToSquared(this.lastPlayerPos) <= 24 * 24)
+      .sort((a, b) => a[1].distanceToSquared(this.lastPlayerPos) - b[1].distanceToSquared(this.lastPlayerPos)).slice(0, MAX_TORCH_LIGHTS);
+    const keep = new Set(nearest.map(([key]) => key));
+    for (const [key, t] of this.torchLights) if (!keep.has(key)) this.removeTorchLight(t.x, t.y, t.z);
+    for (const [, p] of nearest) this.addTorchLight(p.x, p.y, p.z);
+  }
+
+  public queueWater(x: number, y: number, z: number, spread: number) {
+    const key = this.getKey(x, y, z);
+    if (this.waterQueued.has(key) || this.pendingWaterFlow.length >= MAX_WATER_QUEUE) return;
+    this.waterQueued.add(key); this.pendingWaterFlow.push({ x, y, z, spread });
+  }
   public updateWaterPhysics(delta: number) {
     this.waterFlowTimer += delta;
-    if (this.waterFlowTimer < 0.35 || this.pendingWaterFlow.length === 0) return;
+    if (this.waterFlowTimer < 0.35 || !this.pendingWaterFlow.length) return;
     this.waterFlowTimer = 0;
-
-    let changes = 0;
-    const nextQueue: Array<{ x: number; y: number; z: number; spread: number }> = [];
-    const limit = Math.min(this.pendingWaterFlow.length, 16);
-
-    for (let i = 0; i < limit; i++) {
-      const item = this.pendingWaterFlow.shift();
-      if (!item) break;
-      const { x, y, z, spread } = item;
+    const batch = this.pendingWaterFlow.splice(0, 16);
+    let changes = false;
+    const flow = (x: number, y: number, z: number, spread: number) => {
+      if (this.waterLevels.size >= MAX_FLOWING_WATER || !this.generatedChunks.has(this.getChunkKey(Math.floor(x / 16), Math.floor(z / 16))) || this.getBlock(x, y, z)) return false;
+      this.waterLevels.set(this.getKey(x, y, z), spread);
+      this.addBlock(x, y, z, BLOCKS.WATER, false); changes = true; return true;
+    };
+    for (const { x, y, z, spread } of batch) {
+      this.waterQueued.delete(this.getKey(x, y, z));
       if (this.getBlock(x, y, z) !== BLOCKS.WATER) continue;
-
-      // 1. Flow down with gravity if air or empty beneath
-      const belowY = y - 1;
-      if (belowY > BEDROCK_Y) {
-        const belowBlock = this.getBlock(x, belowY, z);
-        if (belowBlock === null || belowBlock === BLOCKS.AIR) {
-          this.addBlock(x, belowY, z, BLOCKS.WATER, false);
-          nextQueue.push({ x, y: belowY, z, spread: 0 });
-          changes++;
-          continue;
-        }
-      }
-
-      // 2. Spread laterally if bottom is blocked and spread distance not exceeded
-      if (spread < 3) {
-        const sides = [
-          [x + 1, y, z],
-          [x - 1, y, z],
-          [x, y, z + 1],
-          [x, y, z - 1],
-        ];
-        for (const [sx, sy, sz] of sides) {
-          const sBlock = this.getBlock(sx, sy, sz);
-          if (sBlock === null || sBlock === BLOCKS.AIR) {
-            this.addBlock(sx, sy, sz, BLOCKS.WATER, false);
-            nextQueue.push({ x, y: sy, z: sz, spread: spread + 1 });
-            changes++;
-          }
-        }
-      }
+      if (this.getBlock(x, y - 1, z) === BLOCKS.WATER) continue;
+      if (y - 1 > BEDROCK_Y && flow(x, y - 1, z, spread)) continue;
+      if (spread < 3) for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) flow(x + dx, y, z + dz, spread + 1);
     }
+    if (changes) this.updateInstancedMeshes(this.lastPlayerPos);
+  }
 
-    if (nextQueue.length > 0) {
-      this.pendingWaterFlow.push(...nextQueue);
-    }
-
-    if (changes > 0) {
-      this.updateInstancedMeshes(this.lastPlayerPos);
+  public primeTnt(x: number, y: number, z: number, remaining = 1.5) {
+    if (this.primedTnt.length >= 128) return false;
+    this.primedTnt.push({ x, y, z, remaining }); return true;
+  }
+  public updateTnt(delta: number) {
+    for (let i = this.primedTnt.length - 1; i >= 0; i--) {
+      const tnt = this.primedTnt[i]; tnt.remaining -= delta;
+      if (tnt.remaining > 1e-9) continue;
+      // A player can move beyond the fuse location: regenerate edits before exploding.
+      this.generateChunk(Math.floor(tnt.x / 16), Math.floor(tnt.z / 16));
+      this.primedTnt.splice(i, 1); this.explode(tnt.x, tnt.y, tnt.z, 4);
+      this.lastPlayerChunkX = null;
     }
   }
 
@@ -794,13 +826,19 @@ export class VoxelWorld {
       const imesh = this.instancedMeshes[type];
       if (imesh) {
         imesh.count = counts[type] || 0;
-        imesh.instanceMatrix.needsUpdate = true;
+        imesh.instanceMatrix.clearUpdateRanges();
+        if (imesh.count > 0) {
+          imesh.instanceMatrix.addUpdateRange(0, imesh.count * 16);
+          imesh.instanceMatrix.needsUpdate = true;
+        }
       }
     }
+    this.syncTorchLights();
   }
 
   // Debris on block break
   public spawnDebris(x: number, y: number, z: number, type: BlockId) {
+    if (this.debrisList.length + 6 > MAX_DEBRIS) return;
     const geo = new THREE.BoxGeometry(0.18, 0.18, 0.18);
     const def = BLOCK_DEFS[type];
     const tex = this.atlas.textures[def ? def.itemId : 'stone'] || this.atlas.textures['stone'];
@@ -831,8 +869,8 @@ export class VoxelWorld {
       d.life -= delta;
       if (d.life <= 0) {
         this.scene.remove(d.mesh);
-        d.mesh.geometry.dispose();
         this.debrisList.splice(i, 1);
+        if (!this.debrisList.some(other => other.mesh.geometry === d.mesh.geometry)) disposeObjects([d.mesh]);
       }
     }
   }
@@ -868,6 +906,11 @@ export class VoxelWorld {
     const bz = Math.floor(z);
     const rInt = Math.ceil(radius);
 
+    // Regenerate all affected chunk edges before a remote, saved fuse detonates.
+    for (let cx = Math.floor((bx - rInt) / CHUNK_SIZE); cx <= Math.floor((bx + rInt) / CHUNK_SIZE); cx++) {
+      for (let cz = Math.floor((bz - rInt) / CHUNK_SIZE); cz <= Math.floor((bz + rInt) / CHUNK_SIZE); cz++) this.generateChunk(cx, cz);
+    }
+
     for (let dx = -rInt; dx <= rInt; dx++) {
       for (let dy = -rInt; dy <= rInt; dy++) {
         for (let dz = -rInt; dz <= rInt; dz++) {
@@ -878,13 +921,15 @@ export class VoxelWorld {
             const tz = bz + dz;
             const type = this.getBlock(tx, ty, tz);
             if (type && type !== BLOCKS.BEDROCK) {
-              this.removeBlock(tx, ty, tz, true);
+              this.removeBlock(tx, ty, tz, true, false);
               destroyed.push(type);
             }
           }
         }
       }
     }
+    if (destroyed.length) this.updateInstancedMeshes(this.lastPlayerPos);
+    this.lastPlayerChunkX = null;
     return destroyed;
   }
 
@@ -892,6 +937,7 @@ export class VoxelWorld {
   public exportSaveData(): WorldSave {
     return {
       seed: this.seed,
+      waterLevels: [...this.waterLevels].map(([key, spread]) => { const [x, y, z] = key.split(',').map(Number); return { x, y, z, spread }; }),
       edits: Array.from(this.blockEdits, ([key, type]) => {
         const [x, y, z] = key.split(',').map(Number);
         return { x, y, z, type };
@@ -902,14 +948,18 @@ export class VoxelWorld {
   // Call only with a validated snapshot, before generating the restored player's area.
   public importSaveData(data: WorldSave) {
     this.seed = data.seed;
-    this.blockEdits = new Map(data.edits.map(b => [this.getKey(b.x, b.y, b.z), b.type]));
+    this.blockEdits.clear(); this.editsByChunk.clear();
+    for (const b of data.edits) this.recordEdit(this.getKey(b.x, b.y, b.z), b.type, Math.floor(b.x / 16), Math.floor(b.z / 16));
+    this.waterLevels = new Map((data.waterLevels ?? data.edits.filter(b => b.type === BLOCKS.WATER).map(b => ({ ...b, spread: 3 }))).map(b => [this.getKey(b.x, b.y, b.z), b.spread]));
+    this.torchPositions.clear(); this.primedTnt = [];
     this.worldData.clear();
     this.chunkData.clear();
     this.generatedChunks.clear();
     this.chunkRenderData.clear();
     this.dirtyChunks.clear();
-    this.pendingWaterFlow = [];
+    this.pendingWaterFlow = []; this.waterQueued.clear();
     this.waterFlowTimer = 0;
+    this.lastRenderDistance = -1;
     this.lastPlayerChunkX = null;
     this.lastPlayerChunkZ = null;
     for (const torch of this.torchLights.values()) {
@@ -920,6 +970,14 @@ export class VoxelWorld {
     this.setTargetHighlight(null);
     this.setCrackStage(null, -1);
     this.updateInstancedMeshes();
+  }
+
+  public dispose() {
+    disposeObjects([...Object.values(this.instancedMeshes), this.targetBoxMesh, this.crackMesh, ...this.debrisList.map(d => d.mesh)].filter(Boolean) as THREE.Object3D[]);
+    for (const t of this.torchLights.values()) { t.light.removeFromParent(); t.light.dispose(); }
+    this.torchLights.clear(); this.torchPositions.clear(); this.debrisList = [];
+    this.worldData.clear(); this.chunkData.clear(); this.generatedChunks.clear(); this.chunkRenderData.clear(); this.dirtyChunks.clear();
+    this.pendingWaterFlow = []; this.waterQueued.clear(); this.waterLevels.clear(); this.blockEdits.clear(); this.editsByChunk.clear();
   }
 
   // Fast Voxel Traversal (DDA) for 100% reliable raycasting

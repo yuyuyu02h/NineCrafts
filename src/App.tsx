@@ -6,18 +6,21 @@ import { buildGameTextures, TextureAtlas } from './textures';
 import { VoxelWorld, BEDROCK_Y } from './world';
 import { MobManager } from './mobs';
 import { sound } from './audio';
-import { InventorySlot, GameMode, Achievement } from './types';
-import { CRAFTING_RECIPES, SMELTING_RECIPES, matchRecipe } from './recipes';
+import { GameMode, Achievement } from './types';
+import { CRAFTING_RECIPES, matchRecipe } from './recipes';
 import { ShaderEnvironment } from './environment';
 import { loadGame, saveGame } from './storage';
 import { SAVE_VERSION, type GameSave } from './save';
 import { useItems } from './useItems';
-import { clickInventory, clickCraftCell, craftGrid, quickCraft, insertStack, stack, returnCursor, ensureFurnace, clickFurnaceSlot, collectFurnace, wearTool } from './items';
+import { clickInventory, clickCraftCell, craftGrid, quickCraft, insertStack, stack, returnCursor, ensureFurnace, clickFurnaceSlot, collectFurnace, wearTool, ensureChest, clickChest, collectChestSlot } from './items';
 import { consumeSlot, stepFurnace } from './furnace';
 import { miningRule, toolSignature } from './mining';
 import { ItemMenu } from './ItemMenu';
 import { TouchControls } from './TouchControls';
 import { bindGameMouse } from './mouseInput';
+import { FixedStepper, GameSession, findSafeSpawn, resetPlayerView, normalizeYaw } from './simulation';
+import { disposeObjects } from './resources';
+import { bodyBox, mobHeight } from './combat';
 import {
   Volume2,
   VolumeX,
@@ -54,9 +57,15 @@ export default function App() {
   const persistenceRef = useRef({ initialized: false, canWrite: false, busy: false, lastSavedAt: null as number | null });
 
   // Game UI States
+  const sessionRef = useRef(new GameSession());
+  const [isDead, setIsDead] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const playingRef = useRef(false);
-  const setPlaying = useCallback((value: boolean) => { playingRef.current = value; setIsPlaying(value); }, []);
+  const setPlaying = useCallback((value: boolean) => {
+    if (value) sessionRef.current.play(); else sessionRef.current.pause();
+    const active = sessionRef.current.phase === 'playing';
+    playingRef.current = active; setIsPlaying(active);
+  }, []);
   const [touchEnabled, setTouchEnabled] = useState(() => window.matchMedia('(pointer: coarse)').matches);
   const touchEnabledRef = useRef(touchEnabled);
   touchEnabledRef.current = touchEnabled;
@@ -64,14 +73,18 @@ export default function App() {
   const primaryHeldRef = useRef(false);
   const [miningView, setMiningView] = useState({ percent: 0, label: '' });
   const [itemMessage, setItemMessage] = useState('');
+  const [activeChestKey, setActiveChestKey] = useState<string | null>(null);
   const [activeFurnaceKey, setActiveFurnaceKey] = useState<string | null>(null);
   const { items, itemsRef, updateItems, publishItems } = useItems();
   const { inventory, cursorItem, craft2x2, craft3x3 } = items;
   const [gameMode, setGameMode] = useState<GameMode>('survival');
   const [activeSlot, setActiveSlot] = useState(0); // 0 - 8
-  const [health, setHealth] = useState(20); // 0 - 20 (10 hearts)
-  const [hunger, setHunger] = useState(20); // 0 - 20 (10 drumsticks)
-  const [oxygen, setOxygen] = useState(10); // 0 - 10 (10 bubbles underwater)
+  const [health, setHealthView] = useState(20);
+  const setHealth = (value: React.SetStateAction<number>) => { const state = sessionRef.current; state.health = typeof value === 'function' ? value(state.health) : value; }; // 0 - 20 (10 hearts)
+  const [hunger, setHungerView] = useState(20);
+  const setHunger = (value: React.SetStateAction<number>) => { const state = sessionRef.current; state.hunger = typeof value === 'function' ? value(state.hunger) : value; }; // 0 - 20 (10 drumsticks)
+  const [oxygen, setOxygenView] = useState(10);
+  const setOxygen = (value: React.SetStateAction<number>) => { const state = sessionRef.current; state.oxygen = typeof value === 'function' ? value(state.oxygen) : value; }; // 0 - 10 (10 bubbles underwater)
   const [isUnderwater, setIsUnderwater] = useState(false);
   const [timeString, setTimeString] = useState('12:00');
   const [lumenPercent, setLumenPercent] = useState(100);
@@ -85,11 +98,6 @@ export default function App() {
   const wasInWaterRef = useRef(false);
   const swimSoundTimerRef = useRef(0);
   const drownTimerRef = useRef(0);
-
-  // Chest State (27 slots)
-  const [chestSlots, setChestSlots] = useState<InventorySlot[]>(
-    () => Array.from({ length: 27 }, () => ({ itemId: null, count: 0 }))
-  );
 
   // Settings
   const [soundEnabled, setSoundEnabled] = useState(true);
@@ -115,7 +123,7 @@ export default function App() {
 
   // The save callback reads the latest committed UI snapshot, not the initialization closure.
   const saveUi = {
-    activeSlot, chestSlots,
+    activeSlot,
     achievements: achievements.filter(a => a.unlocked).map(a => a.id),
     settings: { gameMode, soundEnabled, musicEnabled, fov, renderDist, peaceful },
     health, hunger, oxygen,
@@ -150,8 +158,6 @@ export default function App() {
       maxDuration: number;
       signature: string;
     };
-    lastAttackTime: number;
-    lastHurtTime: number;
     isNight: boolean;
   } | null>(null);
 
@@ -159,9 +165,9 @@ export default function App() {
     const persistence = persistenceRef.current;
     const refs = threeRefs.current;
     if (!refs || !persistence.initialized || !persistence.canWrite || persistence.busy) return;
-    const ui = saveUiRef.current;
+    const ui = { ...saveUiRef.current, health: sessionRef.current.health, hunger: sessionRef.current.hunger, oxygen: sessionRef.current.oxygen };
     // Death is followed by the existing respawn flow. Don't persist an intermediate HP=0 state.
-    if (ui.health <= 0) return;
+    if (sessionRef.current.health <= 0) return;
     persistence.busy = true;
     setIsSaving(true);
     try {
@@ -172,9 +178,10 @@ export default function App() {
         version: SAVE_VERSION,
         savedAt: Math.max(Date.now(), (persistence.lastSavedAt ?? 0) + 1),
         world: refs.world.exportSaveData(),
+        primedTnt: refs.world.primedTnt,
         player: {
           position: refs.camera.position.toArray() as [number, number, number],
-          rotation: [refs.camera.rotation.x, refs.camera.rotation.y, refs.camera.rotation.z],
+          rotation: [refs.camera.rotation.x, normalizeYaw(refs.camera.rotation.y), refs.camera.rotation.z],
           health, hunger, oxygen, flying: refs.player.flying,
         },
         timeOfDay: ((refs.timeOfDay % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2),
@@ -239,6 +246,7 @@ export default function App() {
 
     const camera = new THREE.PerspectiveCamera(fov, window.innerWidth / window.innerHeight, 0.1, 1000);
     camera.position.set(8, 12, 8);
+    camera.rotation.order = 'YXZ';
 
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -300,20 +308,20 @@ export default function App() {
         maxDuration: 0.5,
         signature: '',
       },
-      lastAttackTime: 0,
-      lastHurtTime: 0,
       isNight: false,
     };
     threeRefs.current = refs;
     world.onBlockRemoved = (x, y, z, type) => {
-      if (type !== BLOCKS.FURNACE) return;
-      const key = world.getKey(x, y, z);
-      const furnace = itemsRef.current.furnaces[key];
-      if (!furnace) return;
-      for (const value of [furnace.input, furnace.fuel, furnace.output]) {
-        if (value.itemId) mobManager.spawnDroppedItem(value.itemId, value.count, new THREE.Vector3(x + 0.5, y + 0.5, z + 0.5), value.durability);
-      }
-      updateItems(state => { const furnaces = { ...state.furnaces }; delete furnaces[key]; return { ...state, furnaces }; });
+      const key = world.getKey(x, y, z), state = itemsRef.current;
+      const furnace = type === BLOCKS.FURNACE ? state.furnaces[key] : null;
+      const chest = type === BLOCKS.CHEST ? state.chests[key] : null;
+      if (!furnace && !chest) return;
+      const contents = furnace ? [furnace.input, furnace.fuel, furnace.output] : chest!;
+      for (const value of contents) if (value.itemId) mobManager.spawnDroppedItem(value.itemId, value.count, new THREE.Vector3(x + 0.5, y + 0.5, z + 0.5), value.durability);
+      updateItems(state => {
+        const furnaces = { ...state.furnaces }, chests = { ...state.chests };
+        delete furnaces[key]; delete chests[key]; return { ...state, furnaces, chests };
+      });
     };
     let disposed = false;
     const initializeSave = async () => {
@@ -335,7 +343,8 @@ export default function App() {
         world.importSaveData(restored.world);
         world.renderDistance = restored.settings.renderDist;
         camera.position.fromArray(restored.player.position);
-        camera.rotation.set(...restored.player.rotation, 'YXZ');
+        camera.rotation.set(restored.player.rotation[0], restored.player.rotation[1], 0, 'YXZ');
+        world.primedTnt = restored.primedTnt;
         refs.timeOfDay = restored.timeOfDay;
         refs.player.flying = restored.settings.gameMode === 'creative' && restored.player.flying;
         setHealth(restored.player.health);
@@ -343,9 +352,9 @@ export default function App() {
         setOxygen(restored.player.oxygen);
         updateItems(() => ({ inventory: restored.inventory, cursorItem: restored.cursorItem,
           craft2x2: restored.craft2x2, craft3x3: restored.craft3x3,
-          furnaces: restored.furnaces, legacyFurnace: restored.legacyFurnace }));
+          furnaces: restored.furnaces, legacyFurnace: restored.legacyFurnace,
+          chests: restored.chests, legacyChest: restored.legacyChest }));
         setActiveSlot(restored.activeSlot);
-        setChestSlots(restored.chestSlots);
         setAchievements(INITIAL_ACHIEVEMENTS.map(a => ({ ...a, unlocked: restored.achievements.includes(a.id) })));
         setGameMode(restored.settings.gameMode);
         setSoundEnabled(restored.settings.soundEnabled);
@@ -362,8 +371,7 @@ export default function App() {
         }
         setStorageStatus(`続きから再開できます（${new Date(restored.savedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}）`);
       } else {
-        const { height: spawnY } = world.getTerrainHeight(8, 8);
-        camera.position.set(8, Math.max(spawnY + 2.7, 5), 8);
+        camera.position.copy(findSafeSpawn(world));
         if (persistenceRef.current.canWrite) setStorageStatus('30秒ごとに自動保存します。設定画面から手動でも保存できます。');
       }
       world.updateChunks(camera.position);
@@ -405,32 +413,42 @@ export default function App() {
     // Main Game Animation Loop
     let animId: number;
     let uiTimer = 0;
+    const stepper = new FixedStepper();
 
     const animate = () => {
       animId = requestAnimationFrame(animate);
       const delta = Math.min(clock.getDelta(), 0.08);
 
       const ready = persistenceRef.current.initialized && !document.hidden;
-      const equipmentOpen = ['inventory', 'workbench', 'furnace'].includes(openModalRef.current ?? '');
-      if (ready && (playingRef.current || equipmentOpen)) {
+      const active = ready && playingRef.current && !openModalRef.current;
+      stepper.advance(delta, active, dt => {
+        if (!playingRef.current) return;
+        sessionRef.current.advance(dt);
         updateItems(state => {
           let changed = false;
           const furnaces = { ...state.furnaces };
           for (const [key, furnace] of Object.entries(furnaces)) {
-            const next = stepFurnace(furnace, delta);
+            const next = stepFurnace(furnace, dt);
             if (next !== furnace) { furnaces[key] = next; changed = true; }
           }
           return changed ? { ...state, furnaces } : state;
         }, false);
-      }
-      if (ready && playingRef.current) {
-        updateGame(delta, refs);
-        processPrimary(delta, refs);
-      }
+        refs.world.updateTnt(dt);
+        updateGame(dt, refs);
+        if (playingRef.current) processPrimary(dt, refs);
+      });
       uiTimer += delta;
       if (uiTimer >= 0.1) {
         uiTimer = 0;
         publishItems();
+        setHealthView(sessionRef.current.health); setHungerView(sessionRef.current.hunger); setOxygenView(sessionRef.current.oxygen);
+        const { biome } = world.getTerrainHeight(camera.position.x, camera.position.z);
+        const x = Math.floor(camera.position.x), y = Math.floor(camera.position.y), z = Math.floor(camera.position.z);
+        setCoords(previous => previous.x === x && previous.y === y && previous.z === z && previous.biome === biome ? previous : { x, y, z, biome });
+        const hours = Math.floor(((refs.timeOfDay / (Math.PI * 2)) * 24 + 6) % 24);
+        const minutes = Math.floor((refs.timeOfDay / (Math.PI * 2)) * 24 * 60 % 60);
+        setTimeString(`${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`);
+        setLumenPercent(Math.round(Math.max(0.08, Math.sin(refs.timeOfDay)) * 100));
         const progress = refs.breakProgress;
         const percent = progress.pos ? Math.min(100, progress.timer / progress.maxDuration * 100) : 0;
         const label = miningHintRef.current;
@@ -447,7 +465,10 @@ export default function App() {
       cancelAnimationFrame(animId);
       window.removeEventListener('resize', handleResize);
       controls.dispose();
-      renderer.dispose();
+      mobManager.dispose(); world.dispose();
+      disposeObjects([...scene.children], true);
+      for (const tex of new Set([...Object.values(atlas.textures), ...atlas.crackTextures])) tex.dispose();
+      renderer.dispose(); threeRefs.current = null;
     };
   }, []);
 
@@ -461,7 +482,7 @@ export default function App() {
         threeRefs.current.scene.fog.near = renderDist * 9;
         threeRefs.current.scene.fog.far = renderDist * 16 + 6;
       }
-      threeRefs.current.world.updateInstancedMeshes();
+      threeRefs.current.world.updateChunks(threeRefs.current.camera.position);
     }
   }, [fov, renderDist]);
 
@@ -474,6 +495,7 @@ export default function App() {
   useEffect(() => {
     if (gameMode !== 'creative' && threeRefs.current) {
       threeRefs.current.player.flying = false;
+      threeRefs.current.player.velocity.set(0, 0, 0);
     }
   }, [gameMode]);
 
@@ -486,6 +508,7 @@ export default function App() {
     const refs = threeRefs.current;
     if (!refs) return;
     Object.assign(refs.moveState, { forward: false, backward: false, left: false, right: false, jump: false, sprint: false });
+    refs.player.velocity.set(0, 0, 0);
     refs.breakProgress.pos = null;
     refs.breakProgress.timer = 0;
     refs.world.setCrackStage(null, -1);
@@ -493,7 +516,7 @@ export default function App() {
   const beginPlay = useCallback(() => {
     const refs = threeRefs.current;
     const canvas = canvasRef.current;
-    if (!refs || !canvas || !persistenceRef.current.initialized) return;
+    if (!refs || !canvas || !persistenceRef.current.initialized || sessionRef.current.phase === 'dead') return;
     try { sound.unlock(); } catch { setItemMessage('音声を開始できませんでした。操作は続けられます。'); }
     if (touchEnabledRef.current) { setItemMessage(''); setPlaying(true); }
     else {
@@ -502,6 +525,7 @@ export default function App() {
     }
   }, []);
   const openMenu = useCallback((menu: string) => {
+    if (sessionRef.current.phase === 'dead') return;
     resetControls(); setPlaying(false);
     threeRefs.current?.controls.unlock();
     setModal(menu); setItemMessage('');
@@ -537,46 +561,36 @@ export default function App() {
     };
   }, []);
 
-  // Player damage handler
-  const handlePlayerDamage = useCallback(
-    (dmg: number, source: string) => {
-      if (gameModeRef.current === 'creative') return;
-      const refs = threeRefs.current;
-      if (!refs) return;
+  useEffect(() => { threeRefs.current?.mobManager.setPeaceful(peaceful); }, [peaceful]);
 
-      const now = performance.now();
-      if (now - refs.lastHurtTime < 500) return; // Invulnerability frames
-      refs.lastHurtTime = now;
-
-      sound.playHurt(false);
-      setHealth((h) => {
-        const next = Math.max(0, h - dmg);
-        if (next === 0) {
-          // Respawn
-          setTimeout(() => {
-            if (threeRefs.current) {
-              threeRefs.current.camera.position.set(8, 15, 8);
-              threeRefs.current.player.velocity.set(0, 0, 0);
-              setHealth(20);
-              setHunger(20);
-            }
-          }, 1000);
-        }
-        return next;
-      });
-
-      // Camera recoil shake
-      refs.camera.rotation.z += (Math.random() - 0.5) * 0.15;
-    },
-    [gameMode]
-  );
+  const handlePlayerDamage = useCallback((dmg: number, source: string) => {
+    const session = sessionRef.current, refs = threeRefs.current;
+    if (!refs || !session.damage(dmg, source, gameModeRef.current === 'creative')) return;
+    sound.playHurt(false);
+    if (session.phase === 'dead') {
+      resetControls(); setPlaying(false); setModal(null); setIsDead(true); refs.controls.unlock();
+      setHealthView(0);
+    } else refs.camera.rotation.z += (Math.random() - 0.5) * 0.12;
+  }, []);
+  const respawnPlayer = () => {
+    const refs = threeRefs.current;
+    if (!refs || sessionRef.current.phase !== 'dead') return;
+    const position = findSafeSpawn(refs.world);
+    refs.camera.position.copy(position); resetPlayerView(refs.camera, refs.player); resetControls();
+    drownTimerRef.current = 0; swimSoundTimerRef.current = 0; wasInWaterRef.current = false;
+    setIsUnderwater(false); sessionRef.current.respawn(); setIsDead(false);
+    setHealthView(20); setHungerView(20); setOxygenView(10);
+    refs.mobManager.setPeaceful(true); // Clear nearby threats and hostile projectiles at respawn.
+    refs.world.updateChunks(position); beginPlay();
+  };
 
   // Core Physics & Simulation Frame Update
   const updateGame = (delta: number, refs: NonNullable<typeof threeRefs.current>) => {
     const { camera, world, mobManager, player, moveState, environment } = refs;
 
     // 1. Day / Night Celestial Cycle & Shader Environment Update
-    refs.timeOfDay += delta * 0.015;
+    camera.rotation.z *= Math.exp(-12 * delta);
+    refs.timeOfDay = (refs.timeOfDay + delta * 0.015) % (Math.PI * 2);
     const sunAngle = refs.timeOfDay;
     const sunY = Math.sin(sunAngle);
     const isNight = sunY < 0;
@@ -584,11 +598,6 @@ export default function App() {
 
     environment.update(delta, refs.timeOfDay, camera.position);
     world.animateWater(delta);
-
-    const hours = Math.floor(((sunAngle / (Math.PI * 2)) * 24 + 6) % 24);
-    const minutes = Math.floor((((sunAngle / (Math.PI * 2)) * 24 * 60) % 60));
-    setTimeString(`${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`);
-    setLumenPercent(Math.round(Math.max(0.08, sunY) * 100));
 
     // 2. Physical Water Fluid & Swimming Detection
     const px = Math.floor(camera.position.x);
@@ -637,7 +646,7 @@ export default function App() {
       const gravity = player.flying ? 0 : 25.0;
       player.velocity.x -= player.velocity.x * 10.0 * delta;
       player.velocity.z -= player.velocity.z * 10.0 * delta;
-      player.velocity.y -= gravity * delta;
+      player.velocity.y = Math.max(-30, player.velocity.y - gravity * delta);
       if (player.flying) {
         player.velocity.y -= player.velocity.y * 8.0 * delta;
       }
@@ -675,7 +684,7 @@ export default function App() {
       player.velocity.z += inputVec.z * speed * accel * delta;
 
       // Play step sound
-      if (!inWater && player.onGround && Math.random() < 0.12) {
+      if (!inWater && player.onGround && Math.random() < 1 - Math.exp(-7.2 * delta)) {
         sound.playStep('grass');
         // Drain tiny hunger on move
         setHunger((h) => Math.max(0, h - delta * 0.08));
@@ -741,6 +750,7 @@ export default function App() {
     // Void fall safety
     if (camera.position.y < BEDROCK_Y - 5) {
       camera.position.set(8, 12, 8);
+    camera.rotation.order = 'YXZ';
       player.velocity.set(0, 0, 0);
       handlePlayerDamage(5, '奈落');
     }
@@ -758,19 +768,13 @@ export default function App() {
         refs.scene.fog.near = 1.0;
         refs.scene.fog.far = 20.0;
       }
-      // Deplete breath
-      setOxygen((o) => {
-        const nextO = Math.max(0, o - delta * 0.5); // 20s breath
-        if (nextO <= 0) {
+      if (gameModeRef.current !== 'creative') {
+        setOxygen(o => Math.max(0, o - delta * 0.5));
+        if (sessionRef.current.oxygen <= 0) {
           drownTimerRef.current += delta;
-          if (drownTimerRef.current > 1.2) {
-            handlePlayerDamage(1, '溺死');
-            sound.playHurt();
-            drownTimerRef.current = 0;
-          }
+          if (drownTimerRef.current >= 1.2) { handlePlayerDamage(1, '溺死'); drownTimerRef.current = 0; }
         }
-        return nextO;
-      });
+      } else { setOxygen(10); drownTimerRef.current = 0; }
       if (Math.random() < 0.04) {
         sound.playBubble();
       }
@@ -785,20 +789,15 @@ export default function App() {
     }
 
     // 6. Update Mobs & Spawns
+    if (!playingRef.current) return;
+    mobManager.setPeaceful(saveUiRef.current.settings.peaceful);
     mobManager.update(delta, camera.position, handlePlayerDamage, handlePickupItem, isNight);
-    mobManager.handleSpawning(camera.position, isNight, saveUiRef.current.settings.peaceful);
+    mobManager.handleSpawning(camera.position, isNight, saveUiRef.current.settings.peaceful, delta);
 
     // 7. Raycasting for Target Block / Face
     updateTargetBlock(refs);
 
-    // 8. Coordinates & Biome HUD update
-    const { biome } = world.getTerrainHeight(camera.position.x, camera.position.z);
-    setCoords({
-      x: Math.floor(camera.position.x),
-      y: Math.floor(camera.position.y),
-      z: Math.floor(camera.position.z),
-      biome,
-    });
+
   };
 
   // Raycasting to find block player is pointing at
@@ -823,7 +822,7 @@ export default function App() {
   // Input Event Listeners (Keyboard & Mouse)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (!persistenceRef.current.initialized) return;
+      if (!persistenceRef.current.initialized || sessionRef.current.phase === 'dead') return;
       if (e.repeat && ['KeyE', 'KeyF', 'Escape'].includes(e.code)) return;
       // Toggle inventory with 'E'
       if (e.code === 'KeyE') {
@@ -1010,7 +1009,10 @@ export default function App() {
         updateItems(state => ensureFurnace(state, key)); setActiveFurnaceKey(key);
         openMenu('furnace'); return;
       }
-      if (def.isInteractive === 'chest') { setItemMessage('チェストの保管画面は今後の実装項目です。'); return; }
+      if (def.isInteractive === 'chest') {
+        const key = world.getKey(hit.blockPos.x, hit.blockPos.y, hit.blockPos.z);
+        updateItems(state => ensureChest(state, key)); setActiveChestKey(key); openMenu('chest'); return;
+      }
       if (def.isInteractive === 'bed') {
         if (refs.isNight) { refs.timeOfDay = Math.PI * 0.45; setHealth(20); unlockAchievement('bed'); sound.playCraft(); }
         return;
@@ -1022,6 +1024,7 @@ export default function App() {
       setHunger(h => Math.min(20, h + item.foodRestore!.hunger)); sound.playEat(); return;
     }
     if (item?.toolType === 'bow') {
+      if (!sessionRef.current.attack(0.6)) return;
       const arrowIndex = itemsRef.current.inventory.findIndex(s => s.itemId === 'arrow' && s.count > 0);
       if (!creative && arrowIndex < 0) { setItemMessage('矢がありません。'); return; }
       if (!creative) {
@@ -1052,15 +1055,18 @@ export default function App() {
     const item = slot.itemId ? ITEMS[slot.itemId] : null;
     const direction = camera.getWorldDirection(new THREE.Vector3());
     const hit = world.raycast(camera.position, direction, 5.5);
-    const raycaster = new THREE.Raycaster(camera.position, direction, 0, 5);
-    const mobHit = raycaster.intersectObjects(mobManager.mobs.map(m => m.mesh), true)[0];
-    if (mobHit && (!hit || mobHit.distance < hit.distance)) {
+    const ray = new THREE.Ray(camera.position, direction);
+    let target: { mob: typeof mobManager.mobs[number]; distance: number } | null = null;
+    for (const mob of mobManager.mobs) {
+      const point = ray.intersectBox(bodyBox(mob.position, mobHeight(mob.type), mob.type === 'spider' ? 0.6 : 0.45), new THREE.Vector3());
+      if (!point) continue;
+      const distance = point.distanceTo(camera.position);
+      if (distance <= 3 && (!hit || distance < hit.distance) && (!target || distance < target.distance)) target = { mob, distance };
+    }
+    if (target) {
       cancel(); miningHintRef.current = '';
-      const now = performance.now();
-      if (now - refs.lastAttackTime < 400) return;
-      const mob = mobManager.mobs.find(m => { let node: THREE.Object3D | null = mobHit.object; while (node) { if (node === m.mesh) return true; node = node.parent; } return false; });
-      if (!mob) return;
-      refs.lastAttackTime = now;
+      if (!sessionRef.current.attack()) return;
+      const mob = target.mob;
       const killed = mobManager.hurtMob(mob, item?.damage ?? 1, mob.position.clone().sub(camera.position));
       if (gameModeRef.current !== 'creative') updateItems(state => ({ ...state, inventory: wearTool(state.inventory, index) }));
       if (killed && mob.isHostile) unlockAchievement('hunter');
@@ -1085,7 +1091,8 @@ export default function App() {
     if (gameModeRef.current !== 'creative') updateItems(state => ({ ...state, inventory: wearTool(state.inventory, index) }));
     if (removed === BLOCKS.TNT) {
       sound.playCreeperHiss();
-      setTimeout(() => { world.explode(hit.blockPos.x, hit.blockPos.y, hit.blockPos.z, 4); unlockAchievement('tnt'); }, 1500);
+      if (world.primeTnt(hit.blockPos.x, hit.blockPos.y, hit.blockPos.z)) unlockAchievement('tnt');
+      else mobManager.spawnDroppedItem('tnt', 1, hit.blockPos.clone().addScalar(0.5));
       return;
     }
     if (gameModeRef.current !== 'creative') {
@@ -1103,7 +1110,7 @@ export default function App() {
     const refs = threeRefs.current;
     if (!refs || !playingRef.current) return;
     refs.camera.rotation.order = 'YXZ';
-    refs.camera.rotation.y -= dx * 0.004;
+    refs.camera.rotation.y = normalizeYaw(refs.camera.rotation.y - dx * 0.004);
     refs.camera.rotation.x = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, refs.camera.rotation.x - dy * 0.004));
   }, []);
   const handleTouchMine = useCallback((held: boolean) => { primaryHeldRef.current = held && playingRef.current; }, []);
@@ -1339,7 +1346,14 @@ export default function App() {
       </div>
 
       {/* Start / Pause Blocker Screen */}
-      {!isPlaying && !openModal && (
+      {isDead && <div className="absolute inset-0 z-50 bg-black/85 flex items-center justify-center p-4">
+        <section role="dialog" aria-modal="true" aria-labelledby="death-title" className="max-w-sm w-full bg-neutral-900 p-6 rounded-2xl text-center space-y-4">
+          <h2 id="death-title" className="text-xl font-bold text-rose-300">倒れました</h2>
+          <p className="text-sm">{sessionRef.current.deathReason}。所持品は保持しています。</p>
+          <button autoFocus onClick={respawnPlayer} className="min-h-12 w-full bg-emerald-500 text-black font-bold rounded-lg">安全な場所にリスポーン</button>
+        </section>
+      </div>}
+      {!isPlaying && !isDead && !openModal && (
         <div className="absolute inset-0 z-40 bg-black/75 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center">
           <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto max-w-md w-full bg-neutral-900/90 border border-white/15 p-8 rounded-2xl shadow-2xl space-y-6">
             <div className="space-y-2">
@@ -1382,8 +1396,14 @@ export default function App() {
         </div>
       )}
 
-      {(['inventory', 'workbench', 'furnace'] as const).map(mode => openModal === mode && (
-        <ItemMenu key={mode} mode={mode} items={items} activeSlot={activeSlot} creative={gameMode === 'creative'}
+      {(['inventory', 'workbench', 'furnace', 'chest'] as const).map(mode => openModal === mode && (
+        <ItemMenu key={mode} mode={mode} items={items} activeSlot={activeSlot} creative={gameMode === 'creative'} paused
+          chestKey={activeChestKey} onChest={(index, collect) => {
+            if (!activeChestKey) return;
+            const before = itemsRef.current;
+            const next = updateItems(state => collect ? collectChestSlot(state, activeChestKey, index) : clickChest(state, activeChestKey, index));
+            setItemMessage(next === before ? '空きが足りないため、残りはチェストに保持しています。' : '');
+          }}
           furnaceKey={activeFurnaceKey} textures={threeRefs.current?.atlas.dataUrls ?? {}} message={itemMessage}
           onClose={closeMenu} onInventory={handleSlotClick} onCell={handleCraftGridClick} onCraft={handleCraftTakeResult}
           onQuick={handleQuickCraft} onFurnace={handleFurnaceSlot} onReturnCursor={handleReturnCursor} />

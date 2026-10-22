@@ -1,18 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseSave, type GameSave } from '../src/save';
+import { BLOCKS } from '../src/blocks';
 import { loadGame, saveGame } from '../src/storage';
 
 function fixture(): GameSave {
   const empty = () => ({ itemId: null, count: 0 });
   return {
-    version: 2, savedAt: 1_000, world: { seed: 123, edits: [{ x: -1, y: 2, z: 16, type: 0 }] },
+    version: 3, savedAt: 1_000, world: { seed: 123, edits: [{ x: -1, y: 2, z: 16, type: 0 }] },
     player: { position: [-1, 4.62, 16], rotation: [0, 1, 0], health: 17, hunger: 12.3, oxygen: 9.5, flying: false },
     timeOfDay: 3, inventory: Array.from({ length: 36 }, empty), activeSlot: 4,
     cursorItem: { itemId: 'wood', count: 3 },
     craft2x2: [['wood', null], [null, null]], craft3x3: Array.from({ length: 3 }, () => [null, null, null]),
     furnaces: { '-1,2,16': { input: { itemId: 'iron_ore', count: 2 }, fuel: empty(), output: { itemId: 'iron_ingot', count: 1 }, progress: 1.5, fuelTime: 0 } }, legacyFurnace: null,
-    chestSlots: Array.from({ length: 27 }, empty), achievements: ['wood'],
+    chests: {}, legacyChest: Array.from({ length: 27 }, empty), primedTnt: [], achievements: ['wood'],
     drops: [{ itemId: 'stick', count: 2, position: [-1, 5, 16], velocity: [1, -2, 1], life: 120 }],
     settings: { gameMode: 'survival', soundEnabled: false, musicEnabled: false, fov: 90, renderDist: 2, peaceful: false },
   };
@@ -21,7 +22,7 @@ function fixture(): GameSave {
 test('a complete save round-trips without losing cursor, crafting, equipment or drops', () => {
   const input = fixture();
   input.inventory[0] = { itemId: 'wood_pickaxe', count: 1, durability: 27 };
-  input.chestSlots[26] = { itemId: 'diamond', count: 12 };
+  input.legacyChest![26] = { itemId: 'diamond', count: 12 };
   const result = parseSave(JSON.parse(JSON.stringify(input)));
   assert.deepEqual(result, input);
   result.inventory[0].count = 0;
@@ -75,9 +76,9 @@ test('storage-unavailable failures are explicit and do not pretend to save', asy
 
 test('v1 saves migrate furnace contents and cooking progress without throwing away items', () => {
   const { furnaces, legacyFurnace, ...base } = fixture();
-  const legacy = { ...base, version: 1, furnace: { ...furnaces['-1,2,16'], progress: 45 } };
+  const legacy = { ...base, chestSlots: base.legacyChest, version: 1, furnace: { ...furnaces['-1,2,16'], progress: 45 } };
   const migrated = parseSave(legacy);
-  assert.equal(migrated.version, 2);
+  assert.equal(migrated.version, 3);
   assert.deepEqual(migrated.furnaces, {});
   assert.equal(migrated.legacyFurnace?.input.count, 2);
   assert.equal(migrated.legacyFurnace?.output.count, 1);
@@ -85,11 +86,31 @@ test('v1 saves migrate furnace contents and cooking progress without throwing aw
   assert.deepEqual(migrated.inventory, legacy.inventory);
 });
 
-test('v2 saves validate independent furnace coordinates and tool-drop durability', () => {
+test('current saves validate independent furnace coordinates and tool-drop durability', () => {
   const valid = fixture();
   valid.drops = [{ itemId: 'wood_pickaxe', count: 1, durability: 2, position: [0, 2, 0], velocity: [0, 0, 0], life: 180 }];
   assert.equal(parseSave(valid).drops[0].durability, 2);
   assert.throws(() => parseSave({ ...valid, furnaces: { invalid: valid.furnaces['-1,2,16'] } }));
   valid.drops[0].durability = 500;
   assert.throws(() => parseSave(valid));
+});
+
+test('v2 chest data migrates once and v3 persists independent chests, wear, water and TNT', () => {
+  const current = fixture();
+  const old = { ...current, version: 2, chestSlots: current.legacyChest };
+  old.chestSlots![0] = { itemId: 'wood', count: 9 };
+  const migrated = parseSave(old);
+  assert.equal(migrated.version, 3); assert.equal(migrated.legacyChest![0].count, 9);
+  assert.deepEqual(migrated.chests, {}); assert.deepEqual(migrated.primedTnt, []);
+  const v3 = fixture();
+  v3.chests = { '-1,2,16': Array.from({ length: 27 }, () => ({ itemId: null, count: 0 })) };
+  v3.chests['-1,2,16'][0] = { itemId: 'wood_pickaxe', count: 1, durability: 2 };
+  v3.primedTnt = [{ x: 1, y: 2, z: 3, remaining: 0.7 }];
+  v3.world.edits.push({ x: 1, y: 2, z: 3, type: BLOCKS.WATER });
+  v3.world.waterLevels = [{ x: 1, y: 2, z: 3, spread: 2 }];
+  assert.deepEqual(parseSave(v3), v3);
+  assert.throws(() => parseSave({ ...v3, chests: JSON.parse('{"__proto__": []}') }));
+  assert.throws(() => parseSave({ ...v3, chests: { invalid: v3.chests['-1,2,16'] } }));
+  assert.throws(() => parseSave({ ...v3, primedTnt: [{ ...v3.primedTnt[0], remaining: -1 }] }));
+  assert.throws(() => parseSave({ ...v3, world: { ...v3.world, waterLevels: [{ ...v3.world.waterLevels![0], spread: 4 }] } }));
 });

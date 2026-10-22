@@ -3,10 +3,11 @@ import type { GameMode, InventorySlot } from './types';
 import { SMELTING_RECIPES } from './recipes';
 import type { FurnaceState } from './furnace';
 
-export const SAVE_VERSION = 2;
+export const SAVE_VERSION = 3;
 export const MAX_EDITS = 500_000;
 export interface WorldSave {
   seed: number;
+  waterLevels?: Array<{ x: number; y: number; z: number; spread: number }>;
   edits: Array<{ x: number; y: number; z: number; type: BlockId }>;
 }
 export interface GameSave {
@@ -29,7 +30,9 @@ export interface GameSave {
   craft3x3: (string | null)[][];
   furnaces: Record<string, FurnaceState>;
   legacyFurnace: FurnaceState | null;
-  chestSlots: InventorySlot[];
+  chests: Record<string, InventorySlot[]>;
+  legacyChest: InventorySlot[] | null;
+  primedTnt: Array<{ x: number; y: number; z: number; remaining: number }>;
   achievements: string[];
   drops: Array<{ itemId: string; count: number; durability?: number; position: [number, number, number]; velocity: [number, number, number]; life: number }>;
   settings: {
@@ -70,9 +73,17 @@ function validFurnaces(value: unknown): boolean {
     key.split(',').every(n => integerIn(Number(n), -10_000_000, 10_000_000)) && validFurnace(data));
 }
 
+const coordinateKey = (key: string) => /^-?\d+,-?\d+,-?\d+$/.test(key) && key.split(',').map(Number).join(',') === key && key.split(',').every(n => integerIn(Number(n), -10_000_000, 10_000_000));
+function validChests(value: unknown) {
+  return isRecord(value) && Object.keys(value).length <= 10_000 && Object.entries(value).every(([key, data]) => coordinateKey(key) && slots(data, 27));
+}
+function validTnt(value: unknown) {
+  return Array.isArray(value) && value.length <= 128 && value.every(t => isRecord(t) && [t.x, t.y, t.z].every(n => integerIn(n, -10_000_000, 10_000_000)) && numberIn(t.remaining, 0, 1.5));
+}
+
 // Validate before any live-world mutation. Unknown versions are never reset or overwritten.
 export function parseSave(value: unknown): GameSave {
-  if (!isRecord(value) || (value.version !== 1 && value.version !== SAVE_VERSION)) throw new Error('未対応の保存形式です。保存データは上書きしていません。');
+  if (!isRecord(value) || ![1, 2, SAVE_VERSION].includes(value.version as number)) throw new Error('未対応の保存形式です。保存データは上書きしていません。');
   const { world, player, settings } = value;
   const legacy = value.version === 1;
   if (!isRecord(world) || !integerIn(world.seed, 0, 0xffffffff) || !Array.isArray(world.edits) || world.edits.length > MAX_EDITS) {
@@ -93,7 +104,8 @@ export function parseSave(value: unknown): GameSave {
     !numberIn(player.health, 0, 20) || !numberIn(player.hunger, 0, 20) || !numberIn(player.oxygen, 0, 10) || typeof player.flying !== 'boolean' ||
     !numberIn(value.timeOfDay, 0, Math.PI * 2) || !numberIn(value.savedAt, 0, 8.64e15) ||
     !slots(value.inventory, 36) || !integerIn(value.activeSlot, 0, 8) || !(value.cursorItem === null || slot(value.cursorItem)) ||
-    !grid(value.craft2x2, 2) || !grid(value.craft3x3, 3) || !slots(value.chestSlots, 27) ||
+    !grid(value.craft2x2, 2) || !grid(value.craft3x3, 3) ||
+    !(value.version !== SAVE_VERSION ? slots(value.chestSlots, 27) : validChests(value.chests) && (value.legacyChest === null || slots(value.legacyChest, 27)) && validTnt(value.primedTnt)) ||
     !Array.isArray(value.achievements) || value.achievements.length > 64 ||
     !value.achievements.every(id => typeof id === 'string' && /^[a-z_]{1,40}$/.test(id)) ||
     !Array.isArray(value.drops) || value.drops.length > 10_000 || !value.drops.every(drop =>
@@ -105,6 +117,16 @@ export function parseSave(value: unknown): GameSave {
     !['soundEnabled', 'musicEnabled', 'peaceful'].every(key => typeof settings[key] === 'boolean')) {
     throw new Error('プレイヤー・所持品の保存データが壊れています。');
   }
+  if (world.waterLevels !== undefined) {
+    const water = new Set(world.edits.filter(b => isRecord(b) && b.type === BLOCKS.WATER).map(b => { const cell = b as Record<string, unknown>; return `${cell.x},${cell.y},${cell.z}`; }));
+    const seenWater = new Set<string>();
+    if (!Array.isArray(world.waterLevels) || world.waterLevels.length > MAX_EDITS || !world.waterLevels.every(b => {
+      if (!isRecord(b) || ![b.x, b.y, b.z].every(n => integerIn(n, -10_000_000, 10_000_000)) || !integerIn(b.spread, 0, 3)) return false;
+      const key = `${b.x},${b.y},${b.z}`;
+      if (!water.has(key) || seenWater.has(key)) return false;
+      seenWater.add(key); return true;
+    })) throw new Error('水流の保存データが壊れています。');
+  }
   const result = structuredClone(value);
   if (legacy) {
     const old = result.furnace as FurnaceState;
@@ -114,6 +136,12 @@ export function parseSave(value: unknown): GameSave {
     result.furnaces = {};
     result.version = SAVE_VERSION;
     delete result.furnace;
+  }
+  if (value.version !== SAVE_VERSION) {
+    const old = result.chestSlots as InventorySlot[];
+    result.chests = {}; result.legacyChest = old.some(slot => slot.itemId) ? old : null;
+    result.primedTnt = []; delete result.chestSlots;
+    result.version = SAVE_VERSION;
   }
   return result as unknown as GameSave;
 }

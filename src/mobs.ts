@@ -2,6 +2,9 @@ import * as THREE from 'three';
 import { MobEntity, ArrowEntity } from './types';
 import { VoxelWorld, BEDROCK_Y } from './world';
 import { sound } from './audio';
+import { BLOCKS, BLOCK_DEFS } from './blocks';
+import { disposeObjects } from './resources';
+import { HOSTILE_LIMIT, ANIMAL_LIMIT, ACTIVE_MOB_RADIUS, DESPAWN_MOB_RADIUS, mobHeight, bodyBox, canMelee } from './combat';
 
 export interface DroppedItemEntity {
   mesh: THREE.Group;
@@ -20,6 +23,8 @@ export class MobManager {
   public arrows: ArrowEntity[] = [];
   public droppedItems: DroppedItemEntity[] = [];
   private nextId = 1;
+  private hostileSpawnTimer = 0;
+  private animalSpawnTimer = 0;
 
   constructor(scene: THREE.Scene, world: VoxelWorld) {
     this.scene = scene;
@@ -248,6 +253,8 @@ export class MobManager {
       if ((child as THREE.Mesh).isMesh) {
         child.castShadow = true;
         child.receiveShadow = true;
+        const material = (child as THREE.Mesh).material as THREE.MeshLambertMaterial;
+        if (material.color) material.userData.baseColor = material.color.getHex();
       }
     });
 
@@ -324,7 +331,7 @@ export class MobManager {
   }
 
   public killMob(mob: MobEntity) {
-    this.scene.remove(mob.mesh);
+    disposeObjects([mob.mesh]);
     const idx = this.mobs.indexOf(mob);
     if (idx > -1) this.mobs.splice(idx, 1);
 
@@ -346,7 +353,8 @@ export class MobManager {
     }
   }
 
-  public shootArrow(from: THREE.Vector3, dir: THREE.Vector3, fromPlayer: boolean, speed = 18): ArrowEntity {
+  public shootArrow(from: THREE.Vector3, dir: THREE.Vector3, fromPlayer: boolean, speed = 18): ArrowEntity | null {
+    if (this.arrows.length >= 128) return null;
     sound.playShootBow();
 
     const geo = new THREE.CylinderGeometry(0.04, 0.04, 0.6, 5);
@@ -396,189 +404,110 @@ export class MobManager {
     onPickupItem: (itemId: string, count: number, durability?: number) => number,
     isNight: boolean
   ) {
-    // 1. Update Mobs
+    // All rates use seconds. App supplies 60Hz fixed steps, independent of display refresh.
     for (let i = this.mobs.length - 1; i >= 0; i--) {
       const mob = this.mobs[i];
-
-      // Reset hurt flash
+      const horizontal = Math.hypot(mob.position.x - playerPos.x, mob.position.z - playerPos.z);
+      if (horizontal > DESPAWN_MOB_RADIUS || mob.position.y < BEDROCK_Y - 5) { this.removeMob(mob); continue; }
+      mob.mesh.visible = horizontal <= ACTIVE_MOB_RADIUS;
+      if (!mob.mesh.visible) { mob.velocity.set(0, 0, 0); continue; }
+      mob.attackCooldown = Math.max(0, mob.attackCooldown - delta);
       if (mob.hurtTimer && mob.hurtTimer > 0) {
         mob.hurtTimer -= delta;
-        if (mob.hurtTimer <= 0) {
-          // Re-color back to default
-          // Rebuild materials or simple re-set
-        }
+        if (mob.hurtTimer <= 0) mob.mesh.traverse(c => {
+          const mat = (c as THREE.Mesh).material as THREE.MeshLambertMaterial;
+          if (mat?.color && mat.userData.baseColor !== undefined) mat.color.setHex(mat.userData.baseColor);
+        });
       }
-
-      // Hostile day burning (Zombie burns in daytime)
       if (!isNight && mob.type === 'zombie' && mob.position.y > 0) {
-        this.hurtMob(mob, delta * 3);
-        this.world.spawnDebris(mob.position.x, mob.position.y + 1, mob.position.z, 21); // Flame-like particles
+        mob.hp -= delta * 3;
+        if (mob.hp <= 0) { this.killMob(mob); continue; }
       }
-
-      // Physics (Gravity & drag)
-      mob.velocity.y -= 25 * delta;
-      mob.velocity.x *= 0.88;
-      mob.velocity.z *= 0.88;
-
-      const distToPlayer = mob.position.distanceTo(playerPos);
-
-      // AI Behavior
-      if (mob.isHostile && distToPlayer < 18) {
-        // Look at player
-        const toPlayer = playerPos.clone().sub(mob.position);
-        toPlayer.y = 0;
+      const toPlayer = playerPos.clone().sub(mob.position); toPlayer.y = 0; toPlayer.normalize();
+      let desiredX = 0, desiredZ = 0;
+      if (mob.isHostile && horizontal < 18) {
         mob.rotation = Math.atan2(toPlayer.x, toPlayer.z);
-
-        if (mob.type === 'creeper') {
-          // Sneak up and explode
-          if (distToPlayer > 2.0) {
-            mob.velocity.x += toPlayer.normalize().x * mob.speed * delta * 8;
-            mob.velocity.z += toPlayer.z * mob.speed * delta * 8;
-            mob.exploding = false;
-          } else {
-            // Near player: begin countdown
-            if (!mob.exploding) {
-              mob.exploding = true;
-              mob.fuseTime = 1.3;
-              sound.playCreeperHiss();
-            } else if (mob.fuseTime !== undefined) {
-              mob.fuseTime -= delta;
-              // Swell up
-              const scale = 1.0 + (1.3 - mob.fuseTime) * 0.4;
-              mob.mesh.scale.set(scale, scale, scale);
-
-              if (mob.fuseTime <= 0) {
-                // BOOM!
-                this.world.explode(mob.position.x, mob.position.y + 1, mob.position.z, 3.8);
-                if (distToPlayer < 5) {
-                  onPlayerDamage(Math.floor((5 - distToPlayer) * 3) + 4, 'creeper');
-                }
-                this.scene.remove(mob.mesh);
-                this.mobs.splice(i, 1);
-                continue;
-              }
-            }
-          }
-        } else if (mob.type === 'skeleton') {
-          // Keep 6 to 9 blocks distance and shoot arrows
-          if (distToPlayer < 6) {
-            // Back away
-            mob.velocity.x -= toPlayer.normalize().x * mob.speed * delta * 6;
-            mob.velocity.z -= toPlayer.z * mob.speed * delta * 6;
-          } else if (distToPlayer > 10) {
-            mob.velocity.x += toPlayer.normalize().x * mob.speed * delta * 6;
-            mob.velocity.z += toPlayer.z * mob.speed * delta * 6;
-          }
-
-          mob.attackCooldown -= delta;
-          if (mob.attackCooldown <= 0 && distToPlayer < 14) {
+        const center = mob.position.clone().add(new THREE.Vector3(0, mobHeight(mob.type) * 0.55, 0));
+        const target = playerPos.clone().add(new THREE.Vector3(0, -0.7, 0));
+        const line = target.clone().sub(center), length = line.length();
+        const clear = !this.world.raycast(center, line.normalize(), length);
+        const near = canMelee(mob, playerPos, mob.type === 'creeper' ? 2 : 1.6) && clear;
+        let direction = 1;
+        if (mob.type === 'skeleton') {
+          direction = horizontal < 6 ? -1 : horizontal > 10 ? 1 : 0;
+          if (clear && horizontal < 14 && mob.attackCooldown <= 0) {
             mob.attackCooldown = 2.4;
-            const shootDir = playerPos.clone().sub(mob.position).normalize();
-            shootDir.y += 0.08; // Slight arc
-            this.shootArrow(mob.position.clone().add(new THREE.Vector3(0, 1.2, 0)), shootDir, false, 14);
+            const from = mob.position.clone().add(new THREE.Vector3(0, 1.4, 0));
+            const aim = target.sub(from).normalize(); aim.y += 0.08;
+            this.shootArrow(from, aim, false, 14);
           }
-        } else {
-          // Zombie or Spider: Melee charge
-          mob.velocity.x += toPlayer.normalize().x * mob.speed * delta * 8;
-          mob.velocity.z += toPlayer.z * mob.speed * delta * 8;
-
-          // Spider pounce jump
-          if (mob.type === 'spider' && Math.random() < 0.03 && mob.velocity.y === 0) {
-            mob.velocity.y = 8;
-          }
-
-          // Melee attack player
-          if (distToPlayer < 1.6) {
-            mob.attackCooldown -= delta;
-            if (mob.attackCooldown <= 0) {
-              mob.attackCooldown = 1.0;
-              const dmg = mob.type === 'spider' ? 2 : 3;
-              onPlayerDamage(dmg, mob.name);
+        } else if (mob.type === 'creeper') {
+          if (near) {
+            direction = 0;
+            if (!mob.exploding) { mob.exploding = true; mob.fuseTime = 1.3; sound.playCreeperHiss(); }
+            mob.fuseTime! -= delta;
+            mob.mesh.scale.setScalar(1 + (1.3 - mob.fuseTime!) * 0.4);
+            if (mob.fuseTime! <= 0) {
+              this.world.explode(mob.position.x, mob.position.y + 1, mob.position.z, 3.8);
+              if (horizontal < 5 && clear) onPlayerDamage(Math.floor((5 - horizontal) * 3) + 4, 'creeper');
+              this.removeMob(mob); continue;
             }
+          } else { mob.exploding = false; mob.mesh.scale.setScalar(1); }
+        } else {
+          if (near) {
+            direction = 0;
+            if (mob.attackCooldown <= 0) { mob.attackCooldown = 1; onPlayerDamage(mob.type === 'spider' ? 2 : 3, mob.name); }
           }
+          if (mob.type === 'spider' && mob.velocity.y === 0 && Math.random() < 1 - Math.exp(-1.8 * delta)) mob.velocity.y = 8;
         }
+        desiredX = toPlayer.x * mob.speed * direction; desiredZ = toPlayer.z * mob.speed * direction;
       } else {
-        // Peaceful wandering
-        if (Math.random() < 0.02) {
-          mob.rotation += (Math.random() - 0.5) * 1.5;
-        }
-        if (Math.random() < 0.04) {
-          const forward = new THREE.Vector3(Math.sin(mob.rotation), 0, Math.cos(mob.rotation));
-          mob.velocity.x += forward.x * mob.speed * delta * 4;
-          mob.velocity.z += forward.z * mob.speed * delta * 4;
-        }
+        if (Math.random() < 1 - Math.exp(-1.2 * delta)) mob.rotation += (Math.random() - 0.5) * 1.5;
+        desiredX = Math.sin(mob.rotation) * mob.speed * 0.35; desiredZ = Math.cos(mob.rotation) * mob.speed * 0.35;
       }
-
+      const blend = 1 - Math.exp(-8 * delta);
+      mob.velocity.x += (desiredX - mob.velocity.x) * blend;
+      mob.velocity.z += (desiredZ - mob.velocity.z) * blend;
+      mob.velocity.y = Math.max(-30, mob.velocity.y - 25 * delta);
       mob.mesh.rotation.y = mob.rotation;
-
-      // Apply movement with voxel block collision
-      const checkBlock = (p: THREE.Vector3) => this.world.getBlock(p.x, p.y, p.z);
-
-      mob.position.x += mob.velocity.x * delta;
-      if (checkBlock(new THREE.Vector3(mob.position.x, mob.position.y + 0.5, mob.position.z))) {
-        mob.position.x -= mob.velocity.x * delta;
-        // Try stepping up 1 block (auto jump)
-        if (!checkBlock(new THREE.Vector3(mob.position.x, mob.position.y + 1.5, mob.position.z))) {
-          mob.velocity.y = 6.5;
+      const solid = (x: number, y: number, z: number) => { const b = this.world.getBlock(x, y, z); return !!(b && BLOCK_DEFS[b]?.isSolid); };
+      for (const axis of ['x', 'z'] as const) {
+        const before = mob.position[axis]; mob.position[axis] += mob.velocity[axis] * delta;
+        if (solid(mob.position.x, mob.position.y + 0.4, mob.position.z)) {
+          mob.position[axis] = before;
+          if (!solid(mob.position.x, mob.position.y + 1.5, mob.position.z) && mob.velocity.y <= 0) mob.velocity.y = 6.5;
         }
       }
-
-      mob.position.z += mob.velocity.z * delta;
-      if (checkBlock(new THREE.Vector3(mob.position.x, mob.position.y + 0.5, mob.position.z))) {
-        mob.position.z -= mob.velocity.z * delta;
-        if (!checkBlock(new THREE.Vector3(mob.position.x, mob.position.y + 1.5, mob.position.z))) {
-          mob.velocity.y = 6.5;
-        }
-      }
-
-      mob.position.y += mob.velocity.y * delta;
-      if (checkBlock(new THREE.Vector3(mob.position.x, mob.position.y, mob.position.z))) {
-        mob.position.y = Math.floor(mob.position.y) + 1;
+      const oldY = mob.position.y; mob.position.y += mob.velocity.y * delta;
+      if (solid(mob.position.x, mob.position.y, mob.position.z)) {
+        mob.position.y = mob.velocity.y < 0 ? Math.floor(mob.position.y) + 1 : oldY;
         mob.velocity.y = 0;
       }
     }
 
-    // 2. Update Arrows
     for (let i = this.arrows.length - 1; i >= 0; i--) {
       const arrow = this.arrows[i];
-      arrow.velocity.y -= 12 * delta; // Gravity arc
-      arrow.position.addScaledVector(arrow.velocity, delta);
-      arrow.life -= delta;
-
-      // Align arrow mesh with flight trajectory
-      arrow.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), arrow.velocity.clone().normalize());
-
-      // Check hit block
-      if (this.world.getBlock(arrow.position.x, arrow.position.y, arrow.position.z)) {
-        this.scene.remove(arrow.mesh);
-        this.arrows.splice(i, 1);
-        continue;
-      }
-
-      // Check hit mob (if player arrow)
+      const start = arrow.position.clone();
+      arrow.velocity.y -= 12 * delta;
+      const movement = arrow.velocity.clone().multiplyScalar(delta), distance = movement.length();
+      const ray = new THREE.Ray(start, movement.clone().normalize());
+      const block = distance ? this.world.raycast(start, ray.direction, distance) : null;
+      let nearest = block?.distance ?? distance + 1;
+      let hitMob: MobEntity | null = null, playerHit = false;
+      const point = new THREE.Vector3();
       if (arrow.fromPlayer) {
-        for (const mob of this.mobs) {
-          if (arrow.position.distanceTo(mob.position) < 1.3) {
-            this.hurtMob(mob, 5, arrow.velocity);
-            this.scene.remove(arrow.mesh);
-            this.arrows.splice(i, 1);
-            break;
-          }
+        for (const mob of this.mobs) if (ray.intersectBox(bodyBox(mob.position, mobHeight(mob.type)), point)) {
+          const d = point.distanceTo(start);
+          if (d <= distance && d < nearest) { nearest = d; hitMob = mob; }
         }
-      } else {
-        // Skeleton arrow hit player
-        if (arrow.position.distanceTo(playerPos) < 1.0) {
-          onPlayerDamage(2, 'スケルトンの矢');
-          this.scene.remove(arrow.mesh);
-          this.arrows.splice(i, 1);
-          continue;
-        }
+      } else if (ray.intersectBox(bodyBox(playerPos.clone().add(new THREE.Vector3(0, -1.62, 0)), 1.72, 0.32), point)) {
+        const d = point.distanceTo(start); playerHit = d <= distance && d < nearest;
       }
-
-      if (arrow.life <= 0) {
-        this.scene.remove(arrow.mesh);
-        this.arrows.splice(i, 1);
-      }
+      arrow.position.add(movement); arrow.life -= delta;
+      arrow.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), arrow.velocity.clone().normalize());
+      if (hitMob) this.hurtMob(hitMob, 5, arrow.velocity);
+      if (playerHit) onPlayerDamage(2, 'スケルトンの矢');
+      if (block || hitMob || playerHit || arrow.life <= 0) { disposeObjects([arrow.mesh]); this.arrows.splice(i, 1); }
     }
 
     // 3. Update Dropped Items (rotation, float, player attraction)
@@ -610,7 +539,7 @@ export class MobManager {
           drop.count -= accepted;
         }
         if (drop.count === 0) {
-          this.scene.remove(drop.mesh);
+          disposeObjects([drop.mesh]);
           this.droppedItems.splice(i, 1);
           continue;
         }
@@ -619,37 +548,46 @@ export class MobManager {
       }
 
       if (drop.life <= 0) {
-        this.scene.remove(drop.mesh);
+        disposeObjects([drop.mesh]);
         this.droppedItems.splice(i, 1);
       }
     }
   }
 
-  // Despawn distant mobs and spawn new ones nearby
-  public handleSpawning(playerPos: THREE.Vector3, isNight: boolean, peaceful: boolean) {
-    if (this.mobs.length > 25) return;
-
-    // Spawn chance
-    if (Math.random() < 0.05) {
-      const angle = Math.random() * Math.PI * 2;
-      const radius = 18 + Math.random() * 12;
-      const sx = Math.floor(playerPos.x + Math.cos(angle) * radius);
-      const sz = Math.floor(playerPos.z + Math.sin(angle) * radius);
-      const { height: sy } = this.world.getTerrainHeight(sx, sz);
-
-      if (sy > BEDROCK_Y && sy < 25) {
-        if (isNight && !peaceful) {
-          // Monsters at night
-          const monsters: MobEntity['type'][] = ['zombie', 'creeper', 'skeleton', 'spider'];
-          const type = monsters[Math.floor(Math.random() * monsters.length)];
-          this.spawnMob(type, sx, sy + 1, sz);
-        } else {
-          // Peaceful animals during day
-          const animals: MobEntity['type'][] = ['pig', 'cow', 'sheep'];
-          const type = animals[Math.floor(Math.random() * animals.length)];
-          this.spawnMob(type, sx, sy + 1, sz);
-        }
+  public removeMob(mob: MobEntity) {
+    const index = this.mobs.indexOf(mob);
+    if (index >= 0) { this.mobs.splice(index, 1); disposeObjects([mob.mesh]); }
+  }
+  public setPeaceful(peaceful: boolean) {
+    if (!peaceful) return;
+    for (const mob of [...this.mobs]) if (mob.isHostile) this.removeMob(mob);
+    for (let i = this.arrows.length - 1; i >= 0; i--) if (!this.arrows[i].fromPlayer) {
+      disposeObjects([this.arrows[i].mesh]); this.arrows.splice(i, 1);
+    }
+  }
+  public handleSpawning(playerPos: THREE.Vector3, isNight: boolean, peaceful: boolean, delta = 1 / 60) {
+    const hostile = isNight && !peaceful;
+    const field = hostile ? 'hostileSpawnTimer' : 'animalSpawnTimer';
+    this[field] -= delta;
+    if (this[field] > 0) return;
+    this[field] = hostile ? 2 : 5;
+    if (this.mobs.filter(m => m.isHostile === hostile).length >= (hostile ? HOSTILE_LIMIT : ANIMAL_LIMIT)) return;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const angle = Math.random() * Math.PI * 2, radius = 18 + Math.random() * 12;
+      const x = Math.floor(playerPos.x + Math.cos(angle) * radius), z = Math.floor(playerPos.z + Math.sin(angle) * radius);
+      if (!this.world.generatedChunks.has(this.world.getChunkKey(Math.floor(x / 16), Math.floor(z / 16)))) continue;
+      const height = this.world.getTerrainHeight(x, z).height;
+      for (let y = height + 10; y >= height - 2; y--) {
+        const b = this.world.getBlock(x, y, z);
+        if (!b || !BLOCK_DEFS[b]?.isSolid || b === BLOCKS.LEAVES) continue;
+        if (this.world.getBlock(x, y + 1, z) || this.world.getBlock(x, y + 2, z)) break;
+        const types: MobEntity['type'][] = hostile ? ['zombie', 'creeper', 'skeleton', 'spider'] : ['pig', 'cow', 'sheep'];
+        this.spawnMob(types[Math.floor(Math.random() * types.length)], x + 0.5, y + 1, z + 0.5); return;
       }
     }
+  }
+  public dispose() {
+    disposeObjects([...this.mobs.map(m => m.mesh), ...this.arrows.map(a => a.mesh), ...this.droppedItems.map(d => d.mesh)]);
+    this.mobs = []; this.arrows = []; this.droppedItems = [];
   }
 }

@@ -6,10 +6,13 @@ import { quickCraft, recipeMaterials, type ItemState } from './items';
 import type { InventorySlot } from './types';
 
 interface Props {
-  mode: 'inventory' | 'workbench' | 'furnace';
+  mode: 'inventory' | 'workbench' | 'furnace' | 'chest';
+  chestKey?: string | null;
+  onChest?: (index: number, collect?: boolean) => void;
   items: ItemState;
   activeSlot: number;
   creative: boolean;
+  paused?: boolean;
   furnaceKey: string | null;
   textures: Record<string, string>;
   message: string;
@@ -52,7 +55,7 @@ export function ItemMenu(p: Props) {
       }}
       className="bg-neutral-900 border border-white/20 p-3 sm:p-5 rounded-2xl shadow-2xl max-w-xl w-full space-y-4 max-h-[calc(100dvh-1rem)] overflow-y-auto overscroll-contain">
       <header className="flex items-center justify-between gap-2 border-b border-white/10 pb-2">
-        <h2 id="item-menu-title" className="font-bold">{p.mode === 'furnace' ? '🔥 かまど' : p.mode === 'workbench' ? '🛠️ 作業台' : '🎒 インベントリ'}</h2>
+        <h2 id="item-menu-title" className="font-bold">{p.mode === 'chest' ? '📦 チェスト' : p.mode === 'furnace' ? '🔥 かまど' : p.mode === 'workbench' ? '🛠️ 作業台' : '🎒 インベントリ'}</h2>
         <button ref={closeRef} aria-label="閉じてゲームへ戻る" onClick={p.onClose} className="min-w-11 min-h-11 rounded-lg hover:bg-white/10 text-xl">×</button>
       </header>
       <p role="status" className="text-xs text-amber-200 min-h-4">{p.message || '所持品をタップで持ち、別の枠をタップで移動します。'}</p>
@@ -60,7 +63,16 @@ export function ItemMenu(p: Props) {
         <span>{cursor?.itemId ? `持ち運び中: ${ITEMS[cursor.itemId].name} ×${cursor.count}` : '持ち運び中のアイテムなし'}</span>
         <button disabled={!cursor?.itemId} onClick={p.onReturnCursor} className="min-h-11 shrink-0 px-2 rounded-lg bg-neutral-800 disabled:opacity-40">所持品へ戻す</button>
       </div>
-      {p.mode === 'furnace' ? <>
+      {p.mode === 'chest' ? <section aria-label="チェストの中身">
+        <p className="text-xs text-neutral-400 mb-2">枠をタップで持ち、所持品やチェストの別枠へ移動します。「回収」は空き分だけ移します。</p>
+        <div className="grid grid-cols-5 min-[380px]:grid-cols-5 min-[380px]:grid-cols-6 sm:grid-cols-9 gap-1.5">
+          {(p.chestKey ? p.items.chests[p.chestKey] ?? [] : []).map((slot, index) => <div key={index}>
+            <button aria-label={`保管${index + 1} ${slot.itemId ? `${ITEMS[slot.itemId].name} ×${slot.count}` : '空'}`} onClick={() => p.onChest?.(index)} className={`${slotClass} w-full`}><ItemIcon slot={slot} textures={p.textures} /></button>
+            <button disabled={!slot.itemId} aria-label={`保管${index + 1}を所持品へ回収`} onClick={() => p.onChest?.(index, true)} className="w-full min-h-11 text-[10px] disabled:opacity-30">回収</button>
+          </div>)}
+        </div>
+      </section> : p.mode === 'furnace' ? <>
+        {p.paused && <p className="text-xs text-amber-200">精錬は一時停止中です。この画面を閉じると進みます。</p>}
         <p className="text-xs text-neutral-400">所持品を持って材料・燃料枠へ。枠をタップすると取り出せます。完成品は所持品の空き分だけ回収します。</p>
         <div className="flex items-center justify-around gap-3 p-3 bg-neutral-950 rounded-xl">
           <div className="space-y-2">
@@ -102,7 +114,7 @@ export function ItemMenu(p: Props) {
       </>}
       <section aria-label="所持品">
         <h3 className="text-xs text-neutral-400 mb-2">所持品（1〜9はゲーム画面のホットバー）</h3>
-        <div className="grid grid-cols-6 sm:grid-cols-9 gap-1.5">
+        <div className="grid grid-cols-5 min-[380px]:grid-cols-6 sm:grid-cols-9 gap-1.5">
           {p.items.inventory.map((slot, index) => {
             const def = slot.itemId ? ITEMS[slot.itemId] : null;
             const label = `所持品${index + 1} ${def ? `${def.name} ×${slot.count}${def.durability ? ` 耐久${slot.durability ?? def.durability}/${def.durability}` : ''}` : '空'}`;
